@@ -1,0 +1,407 @@
+
+
+mdl 1.6;
+
+import ::anno::*;
+import ::base::*;
+import ::limits::*;
+import ::state::*;
+import ::tex::*;
+import ::math::*;
+
+import ::OmniSurface::*;
+
+float Linear_Gradient_Function_V( int uIsU, float2 vUv )
+{
+    if ( uIsU == 1 )
+    {
+        return math::frac( vUv.x );
+    }
+    else
+    {
+        return math::frac( vUv.y );
+    }
+}
+
+
+float TopBottomShadowArc( float2 vUv, bool bTop, float Shadow_Top_Arc, float Shadow_Bottom_Arc)
+{
+    float fGradU = Linear_Gradient_Function_V( 1, vUv );
+    float fGradV = Linear_Gradient_Function_V( 0, vUv );
+    if ( bTop )
+    {
+        return math::pow( math::sin( fGradU * math::PI ), Shadow_Top_Arc ) * (fGradV);
+    }
+    else
+    {
+        return math::pow( math::sin( fGradU * math::PI ), Shadow_Bottom_Arc ) *(1 - fGradV);
+    }
+}
+
+// 0 <= x <= 1
+float OneMinusSmoothStep( float x2 )
+{
+    float x = math::saturate( x2 );
+    return 1 - x*x*(3 - 2*x);
+}
+
+
+float ShadowStrengthFunc( float2 vUv, int uIsU, bool bOneMinusUV, float fShadow, float fRange, float Shadow_Top_Arc, float Shadow_Bottom_Arc )
+{
+    float k0 = 0;
+    if ( uIsU == 1 )
+    {
+        k0 = bOneMinusUV ? ( 1 - Linear_Gradient_Function_V( uIsU, vUv ) ):Linear_Gradient_Function_V( uIsU, vUv );
+    }
+    else
+    {
+        k0 = 1 - TopBottomShadowArc( vUv, bOneMinusUV, Shadow_Top_Arc, Shadow_Bottom_Arc );
+    }
+
+    float k1 = ( k0 - 1 + fShadow + fRange/3 ) / ( fRange/3 + 0.000001f );
+
+    return OneMinusSmoothStep( k1 );
+
+    // HLSL cos(x) x=[0,2PI], UE cos(x) x=[0,1] cos(0) = 1, cos(0.25)=0, cos(0.5)=-1, cos(1)=1
+    // but even if the input range is adjust, the result is still wrong
+    //return cos( clamp( k1, 0, 2 ) ) + 0.4;
+}
+
+float3 Premultiplied_Alpha_New_Color_Block (float3 fColor, float fShadowBlock, float fOpacity, float fDuctShadowOffset)
+{
+    float fShadow = math::clamp(fShadowBlock + fDuctShadowOffset, 0, 1 );
+    return (fColor * fShadow) * (fOpacity / (1 - (1 - fOpacity) * fShadow));
+}
+
+float Premultiplied_Alpha_Opacity_Block( float fShadowBlock, float fOpacity, float fDuctShadowOffset )
+{
+    float fShadow = math::clamp(fShadowBlock + fDuctShadowOffset, 0, 1 );
+    return ( 1 - ( 1 - fOpacity ) * fShadow );
+}
+
+float Duct_Edge_Band_Block( float2 vUv, float Tear_Duct_Position )
+{
+    return 1 - math::clamp( math::abs( Linear_Gradient_Function_V( 1, vUv ) - Tear_Duct_Position ), 0, 1 );
+}
+
+
+struct Opacity_Block_Before_OpacityInput
+{
+    float Outer_Corner_Blur_Contrast;
+    float Outer_Corner_Blur_Range;
+    float Bottom_Blur_Contrast;
+    float Bottom_Blur_Range;
+    float Top_Blur_Contrast;
+    float Top_Blur_Range;
+    float Opacity_Power;
+    float Expand;
+    float Tear_Duct_Contrast;
+    float Tear_Duct_Position;
+};
+
+float Opacity_Block_Before_Opacity(uniform texture_2d occTexture, float2 vUv, Opacity_Block_Before_OpacityInput input)
+{
+    float2 vUv1 = float2( vUv.x, ( 1.0f - vUv.y ) );
+    float fGreen = tex::texture_isvalid(occTexture) ? tex::lookup_float3(occTexture, vUv, tex::wrap_repeat, tex::wrap_repeat ).z : 1.f;
+    float fBlurOuterCorner = math::pow( ( 1 - Linear_Gradient_Function_V( 1, vUv1 ) ), 10 - input.Outer_Corner_Blur_Contrast ) * input.Outer_Corner_Blur_Range;
+    float fBlurBottom = math::pow( Linear_Gradient_Function_V( 0, vUv ), 10 - input.Bottom_Blur_Contrast ) * input.Bottom_Blur_Range;
+    float fBlurTop = math::pow( ( 1 - Linear_Gradient_Function_V( 0, vUv ) ), 10 - input.Top_Blur_Contrast ) * input.Top_Blur_Range;
+    float fPerimeter = math::clamp( math::pow( ( 1 - math::frac( fGreen ) ), input.Opacity_Power ) * input.Expand, 0, 1 );
+    float fDuct = math::pow( Duct_Edge_Band_Block( vUv1, input.Tear_Duct_Position ), math::lerp( 50, 5, input.Tear_Duct_Contrast ) );
+
+    return ( fBlurTop + fBlurOuterCorner + fBlurBottom + fPerimeter + fDuct );
+}
+
+export material OmniRLEyeOcclusion(
+
+    // ********* Texture Settings *********
+
+    uniform texture_2d tx2d_Eye_Occlusion = texture_2d() [[
+        anno::display_name("Eye Occlusion"),
+        anno::in_group("Textures")
+    ]],
+
+    
+    bool Display_Blur_Range = false [[
+        anno::display_name("Display_Blur_Range"),
+        anno::in_group("Blur")
+    ]],
+
+    float Blur_Strength = float(1.0) [[
+        anno::display_name("Blur Strength"),
+        anno::hard_range(0.0f, 10.0f),
+        anno::in_group("Blur")
+    ]],
+
+    float Expand = float(2.0) [[
+        anno::display_name("Expand"),
+        anno::hard_range(0.0f, 10.0f),
+        anno::in_group("Blur")
+    ]],
+
+	// 
+    float Top_Blur_Range = float(0.5) [[
+        anno::display_name("Top Blur Range"),
+        anno::hard_range(0.0f, 10.0f),
+        anno::in_group("Blur")
+    ]],
+    float Top_Blur_Contrast = float(3.0) [[
+        anno::display_name("Top Blur Contrast"),
+        anno::hard_range(0.0f, 10.0f),
+        anno::in_group("Blur")
+    ]],
+    float Bottom_Blur_Range = float(1.0) [[
+        anno::display_name("Bottom Blur Range"),
+        anno::hard_range(0.0f, 10.0f),
+        anno::in_group("Blur")
+    ]],
+    float Bottom_Blur_Contrast = float(3.0) [[
+        anno::display_name("Bottom Blur Contrast"),
+        anno::hard_range(0.0f, 10.0f),
+        anno::in_group("Blur")
+    ]],
+    float Outer_Corner_Blur_Range = float(0.5) [[
+        anno::display_name("Outer Corner Blur Range"),
+        anno::hard_range(0.0f, 10.0f),
+        anno::in_group("Blur")
+    ]],
+    float Outer_Corner_Blur_Contrast = float(3.0) [[
+        anno::display_name("Outer Corner Blur Contrast"),
+        anno::hard_range(0.0f, 10.0f),
+        anno::in_group("Blur")
+    ]],
+  	// 
+    float Tear_Duct_Position = float(0.8) [[
+        anno::display_name("Tear Duct Position"),
+        anno::hard_range(0.0f, 1.0f),
+        anno::in_group("Blur")
+    ]],
+
+    float Tear_Duct_Contrast = float(0.8) [[
+        anno::display_name("Tear Duct Contrast"),
+        anno::hard_range(0.0f, 1.0f),
+        anno::in_group("Blur")
+    ]],
+
+	// group("1st_Layer_Shadow")	
+    color Shadow_Color = color(1.0, 1.0, 1.0) [[
+        anno::display_name("Shadow 1 Color"),
+        anno::in_group("Shadow 1")
+    ]],
+
+    float Shadow_Strength = float(0.3) [[
+        anno::display_name("Shadow 1 Strength"),
+        anno::hard_range(0.0f, 1.0f),
+        anno::in_group("Shadow 1")
+    ]],
+
+    float Shadow_Top = float(2.0) [[
+        anno::display_name("Shadow 1 Top"),
+        anno::hard_range(0.0f, 1.0f),
+        anno::in_group("Shadow 1")
+    ]],
+    float Shadow_Top_Range = float(8.0) [[
+        anno::display_name("Shadow 1 Top Range"),
+        anno::hard_range(0.0f, 1.0f),
+        anno::in_group("Shadow 1")
+    ]],
+    float Shadow_Top_Arc = float(1.0) [[
+        anno::display_name("Shadow 1 Top Curvature"),
+        anno::hard_range(0.0f, 2.0f),
+        anno::in_group("Shadow 1")
+    ]],
+    float Shadow_Bottom = float(0.3) [[
+        anno::display_name("Shadow 1 Bottom"),
+        anno::hard_range(0.0f, 1.0f),
+        anno::in_group("Shadow 1")
+    ]],
+    float Shadow_Bottom_Range = float(10.0) [[
+        anno::display_name("Shadow 1 Bottom Range"),
+        anno::hard_range(0.0f, 1.0f),
+        anno::in_group("Shadow 1")
+    ]],
+    float Shadow_Bottom_Arc = float(1.0) [[
+        anno::display_name("Shadow 1 Bottom Curvature"),
+        anno::hard_range(0.0f, 2.0f),
+        anno::in_group("Shadow 1")
+    ]],
+    float Shadow_Inner_Corner = float(0.3) [[
+        anno::display_name("Shadow 1 Inner Corner"),
+        anno::hard_range(0.0f, 1.0f),
+        anno::in_group("Shadow 1")
+    ]],
+    float Shadow_Inner_Corner_Range = float(10.0) [[
+        anno::display_name("Shadow 1 Inner Corner Range"),
+        anno::hard_range(0.0f, 1.0f),
+        anno::in_group("Shadow 1")
+    ]],
+
+    float Tear_Duct_Shadow_Offset = float(1.0) [[
+        anno::display_name("Tear Duct Shadow Offset"),
+        anno::hard_range(0.0f, 1.0f),
+        anno::in_group("Shadow 1")
+    ]],
+    float Shadow_Outer_Corner = float(0.3) [[
+        anno::display_name("Shadow 1 Outer Corner"),
+        anno::hard_range(0.0f, 1.0f),
+        anno::in_group("Shadow 1")
+    ]],
+    float Shadow_Outer_Corner_Range = float(10.0) [[
+        anno::display_name("Shadow 1 Outer Corner Range"),
+        anno::hard_range(0.0f, 1.0f),
+        anno::in_group("Shadow 1")
+    ]],
+
+    float OpacityForBlink = float(1.0) [[
+    
+        anno::hidden(),        
+
+        anno::display_name("OpacityForBlink"),
+        anno::hard_range(0.0f, 1.0f),
+        anno::in_group("Shadow 1")
+    ]],
+
+	// group("2nd_Layer_Shadow")	
+    color Shadow2_Color = color(0.0) [[
+        anno::display_name("Shadow 2 Color"),
+        anno::in_group("Shadow 2")
+    ]],
+    float Shadow2_Strength = float(0.0) [[
+        anno::display_name("Shadow 2 Strength"),
+        anno::hard_range(0.0f, 1.0f),
+        anno::in_group("Shadow 2")
+    ]],
+    float Shadow2_Top = float(2.0) [[
+        anno::display_name("Shadow 2 Top"),
+        anno::hard_range(0.0f, 1.0f),
+        anno::in_group("Shadow 2")
+    ]],
+    float Shadow2_Top_Range = float(8.0) [[
+        anno::display_name("Shadow 2 Top Range"),
+        anno::hard_range(0.0f, 1.0f),
+        anno::in_group("Shadow 2")
+    ]],
+
+    float OpacityStrength = float(0.75) [[
+        anno::display_name("Opacity Strength"),
+        anno::in_group("Opacity"),
+        anno::soft_range(0.0f, 1.0f),
+        anno::hard_range(0.0f, 1.0f)
+    ]]    
+
+
+) = let {
+
+    
+
+    float Iris_Refraction_OnOff = 1.0;
+    float2 uv = float2(state::texture_coordinate(0).x, state::texture_coordinate(0).y);
+    float2 UV0 = float2(uv.x, 1.0 - uv.y);
+    float Opacity_Power = 3.0f; // 3.0 [ 0 10 ]
+    bool bIsExportBig = false;
+    float kMaxRoughness = 0.45f;
+
+    //Color
+    float2 occ_uv = float2(UV0.x, 1 - UV0.y);
+    float3 Blur_Color = Display_Blur_Range && !bIsExportBig ? float3( 1.0, 0.0, 0.0 ) : float3( 1.0, 1.0, 1.0 );
+    float occlusion_sample = tex::texture_isvalid(tx2d_Eye_Occlusion) ? tex::lookup_float3(tx2d_Eye_Occlusion, UV0, tex::wrap_repeat, tex::wrap_repeat).z : float(1.0);
+    float fBlurOuterCorner = math::pow( ( 1 - Linear_Gradient_Function_V( 1, occ_uv ) ), 10 - Outer_Corner_Blur_Contrast ) * Outer_Corner_Blur_Range;
+    float fBlurBottom = math::pow( Linear_Gradient_Function_V( 0, UV0 ), 10 - Bottom_Blur_Contrast ) * Bottom_Blur_Range;
+    float fBlurTop = math::pow( ( 1 - Linear_Gradient_Function_V( 0, UV0 ) ), 10 - Top_Blur_Contrast ) * Top_Blur_Range;
+    float fPerimeter = math::clamp( math::pow( ( 1 - math::frac( occlusion_sample ) ), Opacity_Power ) * Expand, 0, 1 );
+    float fDuct = math::pow( Duct_Edge_Band_Block( occ_uv, Tear_Duct_Position ), math::lerp( 50, 5, Tear_Duct_Contrast ) );
+    float opacity_result = ( fBlurTop + fBlurOuterCorner + fBlurBottom + fPerimeter + fDuct );
+    float3 color_result = math::lerp(float3(1.0), Blur_Color, math::clamp(opacity_result, 0, 1));
+
+
+    //Shadow
+    float fShadowOuterCorner = ShadowStrengthFunc( UV0, 1, true , Shadow_Outer_Corner, Shadow_Outer_Corner_Range, Shadow_Top_Arc, Shadow_Bottom_Arc );
+    float fShadowInnerCorner = ShadowStrengthFunc( UV0, 1, false, Shadow_Inner_Corner, Shadow_Inner_Corner_Range, Shadow_Top_Arc, Shadow_Bottom_Arc );
+    float fShadowTop         = ShadowStrengthFunc( UV0, 0, true , Shadow_Top         , Shadow_Top_Range, Shadow_Top_Arc, Shadow_Bottom_Arc );
+    float fShadowBottom      = ShadowStrengthFunc( UV0, 0, false, Shadow_Bottom      , Shadow_Bottom_Range, Shadow_Top_Arc, Shadow_Bottom_Arc );
+    
+    float fShadow = fShadowTop * fShadowBottom * fShadowInnerCorner * fShadowOuterCorner;
+
+    float shadow = math::lerp( 1, fShadow, Shadow_Strength );
+
+    //Shadow dust
+    float DuctShadowOffset = math::clamp( math::clamp( ( Linear_Gradient_Function_V( 1, UV0 ) - Tear_Duct_Position ) * 12, 0, 1 ) - Tear_Duct_Shadow_Offset, 0, 1 );
+    
+    //Shadow 2
+    float fShadow2 = ShadowStrengthFunc( UV0, 0, true, Shadow2_Top, Shadow2_Top_Range, Shadow2_Top, Shadow2_Top_Range );
+    float Shadow2 = math::lerp( 1, fShadow2, Shadow2_Strength );
+
+
+    //Opacity
+    Opacity_Block_Before_OpacityInput opInput = Opacity_Block_Before_OpacityInput(
+        Outer_Corner_Blur_Contrast: Outer_Corner_Blur_Contrast,
+        Outer_Corner_Blur_Range: Outer_Corner_Blur_Range,
+        Bottom_Blur_Contrast: Bottom_Blur_Contrast,
+        Bottom_Blur_Range: Bottom_Blur_Range,
+        Top_Blur_Contrast: Top_Blur_Contrast,
+        Top_Blur_Range: Top_Blur_Range,
+        Opacity_Power: Opacity_Power,
+        Expand: Expand,
+        Tear_Duct_Contrast: Tear_Duct_Contrast,
+        Tear_Duct_Position: Tear_Duct_Position
+    );
+
+    float op = math::clamp( ( Opacity_Block_Before_Opacity( tx2d_Eye_Occlusion, UV0, opInput ) * (Blur_Strength + 1e-5f) ), 0, 1 );
+
+    //premultiplied alpha
+    float3 outColor = Premultiplied_Alpha_New_Color_Block(color_result, shadow, op, DuctShadowOffset);
+
+    float fOpacity1 = Premultiplied_Alpha_Opacity_Block( shadow, op, DuctShadowOffset );
+    float fOpacity2 = Premultiplied_Alpha_Opacity_Block( Shadow2, op, DuctShadowOffset );
+    float fOpacity = math::max( fOpacity1, fOpacity2 );
+
+    float3 shadow_outcolor_lerp = math::lerp(Shadow_Color, outColor, math::clamp(shadow + DuctShadowOffset, 0, 1));
+    float3 premultipied_shadow = math::max(0, Premultiplied_Alpha_New_Color_Block(shadow_outcolor_lerp, Shadow2, op, DuctShadowOffset));
+    float3 blend_shadow2_premultipied = math::lerp( Shadow2_Color, premultipied_shadow, math::clamp( Shadow2 + DuctShadowOffset, 0, 1 ) );
+
+    float3 transmitColor = float3( math::lerp( float3(1.0), blend_shadow2_premultipied, OpacityForBlink * OpacityStrength ) );
+
+} in 
+::OmniSurface::OmniSurface(
+    diffuse_reflection_weight: float(0.0),
+    diffuse_reflection_color: color(1.0),
+    diffuse_reflection_roughness: float(0.0),
+
+    //Metalness
+    //
+    metalness: float(0.0),
+
+    //Specular reflection
+    //
+    specular_reflection_weight: float(0.0),
+    specular_reflection_color: color(1.0),
+    specular_reflection_ior: float(1.4),
+    specular_reflection_roughness: kMaxRoughness,
+
+    //Specular transmission
+    //
+    enable_specular_transmission: true,
+    specular_transmission_weight: float(1.0),
+    specular_transmission_color: transmitColor,
+    specular_transmission_scattering_depth: float(0.0),
+    specular_transmission_scattering_color: color(0.0),
+    specular_transmission_scatter_anisotropy: float(0.0),
+
+    //Subsurface
+    //
+    enable_diffuse_transmission: false,
+    subsurface_weight: float(1.0),
+    subsurface_transmission_color: color(1.0),
+    subsurface_scattering_color: color(1.0),
+
+    //Specular retro-reflection
+    //
+    specular_retro_reflection_weight: float(0.0),
+    specular_retro_reflection_color: color(1.0),
+    specular_retro_reflection_roughness: float(0.3),
+
+    //Geometry
+    //
+	enable_opacity: true,
+    geometry_opacity: OpacityForBlink * fOpacity * OpacityStrength
+);

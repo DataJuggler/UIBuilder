@@ -1,0 +1,76 @@
+
+
+mdl 1.6;
+
+import ::anno::*;
+import ::base::*;
+import ::limits::*;
+import ::state::*;
+import ::tex::*;
+import ::math::*;
+
+import ::OmniSurface::*;
+
+export material OmniRLEyeCornea(
+
+    float Specular_Scale = float(1.0) [[
+        anno::display_name("Specualr Scale"),
+        anno::hard_range(0.0f, 1.0f),
+        anno::in_group("Eye")
+    ]],
+
+    uniform float IoR = float(1.4) [[
+        anno::display_name("IOR"),
+        anno::hard_range(1.0f, 5.0f),
+        anno::in_group("Iris")
+    ]]
+
+) = let {
+    float Iris_Refraction_OnOff = 1.0;
+
+
+} in 
+::OmniSurface::OmniSurface(
+    diffuse_reflection_weight: float(1.0),
+    diffuse_reflection_color: color(1.0),
+    diffuse_reflection_roughness: float(0.0),
+
+    //Metalness
+    //
+    metalness: float(0.0),
+
+    //Specular reflection
+    //
+    specular_reflection_weight: Specular_Scale,
+    specular_reflection_color: color(1.0),
+    specular_reflection_roughness: float(0.0),
+
+    //Specular transmission
+    //
+    enable_specular_transmission: true,
+    specular_transmission_weight: float(1.0),
+    specular_transmission_color: float3(1.0),
+    specular_transmission_scattering_depth: float(0.0),
+    specular_transmission_scattering_color: color(0.0),
+    specular_transmission_scatter_anisotropy: float(0.0),
+
+    //Subsurface
+    //
+    enable_diffuse_transmission: true,
+    subsurface_weight: float(1.0),
+    specular_reflection_ior: IoR,
+    subsurface_transmission_color: color(1.0),
+    subsurface_scattering_color: color(1.0),
+
+    //Specular retro-reflection
+    //
+    specular_retro_reflection_weight: float(0.0),
+    specular_retro_reflection_color: color(1.0),
+    specular_retro_reflection_roughness: float(0.3),
+
+    //Geometry
+    //
+	enable_opacity: false,
+    geometry_opacity: 1.0
+);
+

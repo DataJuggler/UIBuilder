@@ -1,0 +1,163 @@
+
+
+mdl 1.6;
+
+import ::anno::*;
+import ::base::*;
+import ::limits::*;
+import ::state::*;
+import ::tex::*;
+import ::math::*;
+
+import ::OmniSurface::OmniSurfaceBase::*;
+
+
+
+float TearlineGradient( float G )
+{
+    G = ( G > 0.5 ) ? ( 1 - G ) : G;
+    G = math::saturate( G * 3 );
+    // Ease in out
+    float G2 = G * G;
+    float D = ( G2 - G ) * 2 + 1;
+    return G2 / D;
+}
+
+float RoughnessFromNormal( float3 UnnormalizedNormal, float CompositePower, uniform bool bAddRedChannel )
+{
+    // Toksvig estimation of variance
+    float len = math::min( math::length( UnnormalizedNormal ), 1.0f );
+    float Variance = ( 1.0f - len ) / len;
+    Variance = math::max( 0.0f, Variance - 0.00004f );
+    Variance *= CompositePower;
+
+    if ( bAddRedChannel )  // 'add normal roughness to red'
+    {
+        float Roughness = UnnormalizedNormal.x;
+
+        float a = Roughness * Roughness;
+        float a2 = a * a;
+        float B = 2.0f * Variance * ( a2 - 1.0f );
+        a2 = ( B - a2 ) / ( B - 1.0f );
+        Roughness = math::pow( math::max( a2, 0 ), 0.25f );
+        return Roughness;
+    }
+    else // 'add normal roughness to A'
+    {
+        float B = -2 * Variance;
+        return math::pow( math::abs( B / ( B - 1 ) ), 0.25f );
+    }
+}
+
+
+
+export material OmniRLEyeTearline(
+
+    // ********* Texture Settings *********
+
+    uniform texture_2d tx2d_Normal = texture_2d() [[
+        anno::display_name("Normal Map"),
+        anno::in_group("Textures")
+    ]],
+
+    float Detail_Amount = float(0.25) // 0.25 [ 0 1 ]
+    [[
+        anno::display_name("Detail Amount"),
+        anno::hard_range(0.0f, 1.0f),
+        anno::in_group("Tearline")
+    ]],        
+    float Detail_Scale_U = float(2.3) // 2.3  [ -10 10 ]
+    [[
+        anno::display_name("Detail Scale U"),
+        anno::hard_range(-10.0f, 10.0f),
+        anno::in_group("Tearline")
+    ]],        
+    float Detail_Scale_V = float(0.12) // 0.12 [ -10 10 ]
+    [[
+        anno::display_name("Detail Scale V"),
+        anno::hard_range(-10.0f, 10.0f),
+        anno::in_group("Tearline")
+    ]],        
+    float Edge_Fadeout = float(1.0) // 1.0  [ 0 1 ]
+    [[
+        anno::display_name("Edge Fadeout"),
+        anno::hard_range(0.0f, 1.0f),
+        anno::in_group("Tearline")
+    ]],        
+    float Roughness = float(0.1) // 0.1  [ 0 1 ]
+    [[
+        anno::display_name("Roughness"),
+        anno::hard_range(0.0f, 1.0f),
+        anno::in_group("Tearline")
+    ]],
+
+    float OpacityForBlink = float(1.0)
+    [[
+        anno::display_name("OpacityForBlink"),
+        anno::hard_range(0.0f, 1.0f),
+        anno::in_group("Tearline")
+    ]]
+    
+
+
+) = let {
+    float Metalic = 1.0;
+    float Specular = 1.0;
+    float2 uv = float2(state::texture_coordinate(0).x, state::texture_coordinate(0).y);
+    float2 scaled_uv = uv * float2(Detail_Scale_U, Detail_Scale_V);
+
+    float3 normal_map_sample = tex::texture_isvalid(tx2d_Normal) ? tex::lookup_float3(tx2d_Normal, scaled_uv, tex::wrap_repeat, tex::wrap_repeat) * float3(2.0) - float3(1.0) : float3(0, 0, 1);
+    float3 normalBlend = math::lerp(float3(0, 0, 1), normal_map_sample, Detail_Amount);
+
+	float3 normal = math::normalize(
+        state::texture_tangent_u(0) * normalBlend.x +
+        state::texture_tangent_v(0) * normalBlend.y +
+        state::normal() * (normalBlend.z) );
+
+    float fGradient = TearlineGradient( math::frac( uv.y ) );
+    float fOpacity = Specular * math::lerp( 1, fGradient, Edge_Fadeout ) * OpacityForBlink;        
+
+    float3 vColor = float3(1.0);
+
+    float fAo = 1.0f;
+    float fMetallic = Metalic;
+    // roughness
+    float tempRoughness = RoughnessFromNormal( normal, 0.05f, false ) * Detail_Amount;
+    float r = math::clamp( tempRoughness - 0.1 + Roughness, 0.f, 1.f );
+    float fRoughness = r;
+
+
+} in 
+::OmniSurface::OmniSurfaceBase::OmniSurfaceBase(
+    diffuse_reflection_weight: float(0.0),    
+    diffuse_reflection_color: color(1.0),    
+    diffuse_reflection_roughness: fRoughness,
+    metalness: float(0.0),
+
+    //Specular reflection
+    specular_reflection_weight: Specular,
+    specular_reflection_color: color(1.0),
+    specular_reflection_roughness: fRoughness,
+    specular_reflection_ior: float(1.5),
+
+    enable_specular_transmission: true,
+    specular_transmission_weight: float(1.0),
+    specular_transmission_color: color(1.0),
+    specular_transmission_scattering_depth: float(0.0),
+    specular_transmission_scattering_color: color(1.0),
+    specular_transmission_scatter_anisotropy: float(0.0),
+
+    //Subsurface
+    //
+    enable_diffuse_transmission: false,
+    subsurface_weight: float(1.0),
+    subsurface_transmission_color: color(1.0),
+    subsurface_scattering_color: color(1.0),
+
+    //Geometry
+    //
+    thin_walled: false,
+	enable_opacity: true,
+    geometry_opacity: fOpacity,
+    geometry_normal: normal
+);

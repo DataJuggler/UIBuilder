@@ -1,0 +1,939 @@
+// Copyright (c) 2018-2020, NVIDIA CORPORATION.  All rights reserved.
+//
+// NVIDIA CORPORATION and its licensors retain all intellectual property
+// and proprietary rights in and to this software, related documentation
+// and any modifications thereto.  Any use, reproduction, disclosure or
+// distribution of this software and related documentation without an express
+// license agreement from NVIDIA CORPORATION is strictly prohibited.
+
+// modified from OmniSurface
+
+mdl 1.6;
+
+import ::anno::*;
+import ::base::*;
+import ::limits::*;
+import ::state::*;
+import ::tex::*;
+import ::math::*;
+
+import ::OmniSurface::OmniSurfaceBase::*;
+import ::OmniSurface::OmniShared::*;
+import ::OmniSurface::OmniImage::*;
+
+export enum RLBlendMode
+[[ 
+    anno::description("Blend map blend mode")
+]]
+{
+    blendmode_multiply = 0 [[ 
+        anno::display_name("multiply") 
+    ]],
+
+    blendmode_add = 1 [[ 
+        anno::display_name("add") 
+    ]],
+
+    blendmode_overlay = 2 [[ 
+        anno::display_name("overlay") 
+    ]]
+};
+
+float3 BlendMapByMode( float3 blend_color, float3 base_color, float weight, RLBlendMode mode )
+{
+    float3 top = blend_color;
+    float3 bottom = base_color;
+
+    float3 op_result = top;
+        
+    switch (mode) {
+    case blendmode_multiply:
+        op_result *= bottom;
+        break;
+    case blendmode_add:
+        op_result += bottom;
+        break;
+
+    case blendmode_overlay:
+        {
+
+            float3 mul = base_color*blend_color;
+            float3 add = base_color+blend_color;
+            if (base_color.x >= .5) mul.x = add.x-mul.x-0.5;
+            if (base_color.y >= .5) mul.y = add.y-mul.y-0.5;
+            if (base_color.z >= .5) mul.z = add.z-mul.z-0.5;
+            op_result = mul+mul;
+        }
+        break;
+    }
+    return math::lerp( bottom, op_result, weight );
+}
+
+// [ Sx   0   0 ]   [  cosR   sinR   0 ]   [  1   0   Tx ]   [  SxcosR   SxsinR  Tx ]
+// [  0  Sy   0 ] * [ -sinR   cosR   0 ] * [  0   1   Ty ] = [ -SysinR   SycosR  Ty ]
+// [  0   0   1 ]   [     0      0   1 ]   [  0   0    1 ]   [       0        0   1 ]
+// CRenderKit::SetTextureMatrix
+float3x3 GetUvFloat3x3( float2 kScale, float2 kTrans, float fRotate )
+{
+   	float fCos = math::cos( fRotate );
+    float fSin = math::sin( fRotate );
+    return float3x3 (
+		 kScale[0] * fCos, kScale[0] * fSin, kTrans[0],
+		-kScale[1] * fSin, kScale[1] * fCos, kTrans[1],
+		 0,                0,                1 );
+}
+
+float2 TransformUV( float2 uv, float3x3 uvMatrix )
+{
+	float3 uvw = float3( uv[0], 1 - uv[1], 1 ) * uvMatrix;
+	return float2( uvw[0], 1 - uvw[1] );
+}
+
+float3 BlendAngleCorrectedNormals( float3 BaseNormal, float3 SubNormal )
+{
+    float ZPlus1 = BaseNormal.z + 1;
+    float3 vBaseZPlus1 = float3( BaseNormal.x, BaseNormal.y, ZPlus1 );
+    float3 vSubFlipRG = float3( -SubNormal.x, -SubNormal.y, SubNormal.z );
+    float fDot = math::dot( vBaseZPlus1, vSubFlipRG );
+    return ( vBaseZPlus1 * fDot ) - ( ZPlus1 * vSubFlipRG );
+}
+
+float CheapContrast( float In, float Contrast )
+{
+    return math::saturate( math::lerp( 0 - Contrast, Contrast + 1, In ) );
+}
+
+float3 CustomExpression0(float fAdjustS,float fAdjustV,float3 vHSV)
+{
+	float fs = vHSV.y;
+	if ( fs >1.f )
+	{
+	    fs = fs + fs * fAdjustS;
+	    fs = math::max( 0.f, fs );
+	}
+	else if ( 1.f >= fs && fs > 0.f )
+	{
+	    fs += fAdjustS;
+	    fs = math::max( 0.f, fs );
+	}
+	else if ( 0.f >= fs && fs > -1.f )
+	{
+	    fs -= fAdjustS;
+	    fs = math::min( 0.f, fs );
+	}
+	else
+	{
+	    fs = fs + fs * fAdjustS;
+	    fs = math::min( 0.f, fs );
+	}
+	vHSV.y = fs;
+	float fv = vHSV.z;
+	vHSV.z = ( fv + fAdjustV ) * ( ( fAdjustV + 1.f ) );
+	return vHSV;
+}
+
+// r is slider value
+// k is texture value
+float HQ_SkinRoughnessArea(float r0,float r1,float r2,float r3,float4 vRgba,float UnmaskScale)
+{
+	float k0 = vRgba.x;
+	float k1 = vRgba.y;
+	float k2 = vRgba.z;
+	float k3 = vRgba.w;
+
+	return r0*k0 + r1*k1 + r2*k2 + r3*k3 + ( 1.0 - math::saturate( k0 + k1 + k2 + k3 ) ) * UnmaskScale;
+}
+
+
+float HQ_SkinSSSArea(float r0,float r1,float r2,float r3,float4 vRgba,float UnmaskScale, float SSSMap)
+{
+	float k0 = vRgba.x;
+	float k1 = vRgba.y;
+	float k2 = vRgba.z;
+	float k3 = vRgba.w;
+	
+	float sum = (r0-1.0)*k0 + (r1-1.0)*k1 + (r2-1.0)*k2 + (r3-1.0)*k3 + ( 1.0 - math::saturate( k0 + k1 + k2 + k3 ) ) * (UnmaskScale-1.0);
+	
+	return math::lerp( 0.08, 1, math::saturate( sum + SSSMap ) );
+}
+
+// ref ::OmniSurface::OmniImage::texture_alpha_channel_remap_2
+float adjust_opacity_RL(
+      float4 rgba,
+      uniform ::OmniSurface::OmniImage::alpha_mode alpha_mode,
+      uniform float alpha_gain
+      )
+{ 
+    float mono = 1;
+    switch (alpha_mode) 
+    {
+        case ::OmniSurface::OmniImage::alpha_default:   mono = rgba[3];  break;
+        case ::OmniSurface::OmniImage::alpha_red:       mono = rgba[0];  break;
+        case ::OmniSurface::OmniImage::alpha_green:     mono = rgba[1];  break;
+        case ::OmniSurface::OmniImage::alpha_blue:      mono = rgba[2];  break;
+        case ::OmniSurface::OmniImage::alpha_white:     mono = 1.0f;     break;
+        case ::OmniSurface::OmniImage::alpha_black:     mono = 0.0f;     break;
+        case ::OmniSurface::OmniImage::alpha_luminance: mono = math::luminance( color(rgba[0],rgba[1],rgba[2]) ); break;
+        case ::OmniSurface::OmniImage::alpha_average:   mono = math::average( color(rgba[0],rgba[1],rgba[2]) ); break;
+    }
+    return mono * alpha_gain;
+ }
+
+export material RLSss(
+
+    //Diffuse reflection
+    //
+    color diffuse_color_constant = color(1.0f)
+    [[
+        anno::display_name("Base Color"),
+        anno::description("Material Base Color"),
+        anno::in_group("Base")
+    ]],
+    float diffuse_reflection_weight = float(1) [[ 
+        anno::display_name("Weight"),
+        anno::in_group("Base"),
+        anno::soft_range(0.0f, 1.0f)
+    ]],
+
+    uniform texture_2d diffuse_reflection_color_image = texture_2d() [[ 
+        anno::display_name("Color Image"),
+        anno::in_group("Base")
+    ]],
+
+    uniform texture_2d blend_map = texture_2d()
+    [[
+        anno::display_name("Blend Map"),
+        anno::in_group("Base")
+    ]],
+    uniform float blend_map_strength = 1.0f
+    [[
+        anno::display_name("Blend Map Strength"),
+        anno::in_group("Base"),
+        anno::hard_range(0.0, 1.0)
+    ]],
+    uniform RLBlendMode blend_map_mode = blendmode_multiply
+    [[
+		anno::display_name("Blend Mode"),
+        anno::in_group("Base")
+    ]],
+
+	///////////////////////////////////////////////////
+	// Normal
+    uniform texture_2d geometry_normal_image = texture_2d() [[ 
+        anno::display_name("Normal Map Image"),
+        anno::in_group("Normal")
+    ]],
+
+    uniform bool geometry_normal_image_flip_g_channel = false [[
+        anno::display_name("Normal Map Flip G Channel"),
+        anno::in_group("Normal")
+    ]],
+
+    uniform float geometry_normal_strength = float(0.7f) [[
+        anno::display_name("Normal Map Strength"),
+        anno::in_group("Normal"),
+        anno::soft_range(0.0f, 1.0f)
+    ]],
+    //Micro Normal
+    //
+    uniform texture_2d micro_normal_image = texture_2d() [[ 
+        anno::display_name("Micro Normal Map Image"),
+        anno::in_group("Micro Normal")
+    ]],
+
+    uniform texture_2d micro_normal_mask_image = texture_2d() [[ 
+        anno::display_name("Micro Normal Mask Map Image"),
+        anno::in_group("Micro Normal")
+    ]],
+    uniform bool Flip_MicroNormal_Y = false [[
+        anno::display_name("Normal Map Image Flip G Channel"),
+        anno::in_group("Micro Normal")
+    ]],
+
+    uniform float MicroNormal_Strength = float(0.5f) [[
+        anno::display_name("MicroNormal_Strength"),
+        anno::in_group("Micro Normal"),
+        anno::soft_range(0.0f, 1.0f)
+    ]],
+    uniform float MicroNormal_Tiling = float(30.0f) [[
+        anno::display_name("MicroNormal_Tiling"),
+        anno::in_group("Micro Normal"),
+        anno::soft_range(0.0f, 20.0f)
+   ]],
+
+	///////////////////////////////////////////////////
+	// RL Mask of Roughness and Subsurface
+    uniform texture_2d rgba_area_mask_image = texture_2d() [[ 
+        anno::display_name("RGBA Area Mask Map Image"),
+        anno::in_group("Mask of Roughness and Subsurface")
+    ]],
+	///////////////////////////////////////////////////
+	// Roughness
+    uniform texture_2d specular_reflection_roughness_image = texture_2d() [[ 
+        anno::display_name("Roughness Image"),
+        anno::in_group("Roughness")
+    ]],
+    uniform float roughness_multiplier = float(1.0f) [[
+        anno::display_name("roughness multiplier"),
+        anno::in_group("Roughness"),
+        anno::soft_range(0.1f, 2.f)
+    ]],
+	
+	uniform float roughness_01 = float(0.75f) [[
+        anno::display_name("roughness_min"),
+        anno::in_group("Roughness"),
+        anno::hard_range(0.1f, 2.f)
+    ]],
+	
+	uniform float roughness_02 = float(1.35f) [[
+        anno::display_name("roughness_max"),
+        anno::in_group("Roughness"),
+        anno::hard_range(0.1f, 2.f)
+    ]],
+	uniform float roughness_lerp = float(0.85f) [[
+        anno::display_name("roughness_lerp"),
+        anno::in_group("Roughness"),
+        anno::hard_range(0.0f, 1.f)
+    ]],
+
+	
+    //Roughness Advanced
+    //
+    uniform float Micro_Roughness_Scale = float(0.0) [[
+        anno::display_name("Micro_Roughness_Scale"),
+        anno::in_group("Roughness Advanced"),
+        anno::soft_range(-1.5f, 1.5f)
+    ]],
+    uniform float R_Channel_Roughness_Scale = float(0.0) [[
+        anno::display_name("R_Channel_Roughness_Scale"),
+        anno::in_group("Roughness Advanced"),
+        anno::hard_range(-1.5f, 1.5f)
+    ]],
+    uniform float G_Channel_Roughness_Scale = float(0.0) [[
+        anno::display_name("G_Channel_Roughness_Scale"),
+        anno::in_group("Roughness Advanced"),
+        anno::hard_range(-1.5f, 1.5f)
+    ]],
+    uniform float B_Channel_Roughness_Scale = float(0.0) [[
+        anno::display_name("B_Channel_Roughness_Scale"),
+        anno::in_group("Roughness Advanced"),
+        anno::hard_range(-1.5f, 1.5f)
+    ]],
+    uniform float A_Channel_Roughness_Scale = float(0.0) [[
+        anno::display_name("A_Channel_Roughness_Scale"),
+        anno::in_group("Roughness Advanced"),
+        anno::hard_range(-1.5f, 1.5f)
+    ]],
+    uniform float Unmasked_Roughness_Scale = float(0.0) [[
+        anno::display_name("Unmasked_Roughness_Scale"),
+        anno::in_group("Roughness Advanced"),
+        anno::hard_range(-1.5f, 1.5f)
+    ]],
+
+	///////////////////////////////////////////////////
+    //Metal
+    //
+    uniform texture_2d metalness_image = texture_2d() [[ 
+        anno::display_name("Metalness Image"),
+        anno::in_group("Metallic")
+    ]],
+	///////////////////////////////////////////////////
+    //Specular reflection
+    //
+    float specular_reflection_weight = float(0.4f) [[ 
+        anno::display_name("Weight"),
+        anno::in_group("Specular"),
+        anno::soft_range(0.0f, 1.0f)
+    ]],
+
+    uniform texture_2d specular_reflection_weight_image = texture_2d() [[ 
+        anno::display_name("Weight Image"),
+        anno::in_group("Specular")
+    ]],
+
+    color specular_reflection_color = color(1.0) [[
+        anno::display_name("Specular Color"),
+        anno::in_group("Specular")
+    ]],
+
+    uniform ::OmniSurface::OmniShared::ior_presets specular_reflection_ior_preset = 
+        ::OmniSurface::OmniShared::ior_custom [[
+        anno::display_name("IOR Preset"),
+        anno::in_group("Specular")
+    ]],
+
+    uniform float specular_reflection_ior = float(1.35f) [[ 
+        anno::display_name("IOR"),    
+        anno::in_group("Specular"),
+        anno::soft_range(1.0f, 5.0f)
+    ]],
+
+	///////////////////////////////////////////////////
+	//Specular transmission
+    //
+    uniform bool enable_specular_transmission = false [[
+        anno::display_name("Enable Transmission"),
+        anno::description("Enables the use of transmission"),
+        anno::in_group("Transmission")
+    ]],
+
+    float specular_transmission_weight = float(0.1) [[ 
+        anno::display_name("Weight"),
+        anno::in_group("Transmission"),
+		anno::soft_range(0.0f, 1.0f),
+        anno::hard_range(0.0f, 1.0f)
+    ]],
+
+    uniform texture_2d specular_transmission_weight_image = texture_2d() [[ 
+        anno::display_name("Weight Image"),
+        anno::in_group("Transmission")
+    ]],
+
+    color specular_transmission_color = color(1.0) [[
+        anno::display_name("Color"),
+        anno::in_group("Transmission")
+    ]],
+
+    uniform texture_2d specular_transmission_color_image = texture_2d() [[ 
+        anno::display_name("Color Image"),
+        anno::in_group("Transmission")
+    ]],
+
+    float specular_transmission_scattering_depth = float(1.0) [[ 
+        anno::display_name("Depth"),
+        anno::in_group("Transmission"),    
+        anno::soft_range(0.0f, 100.0f),
+        anno::hard_range(0.0f, limits::FLOAT_MAX)
+    ]],
+
+    uniform texture_2d specular_transmission_scattering_depth_image = texture_2d() [[ 
+        anno::display_name("Depth Image"),
+        anno::in_group("Transmission")
+    ]],
+
+    color specular_transmission_scattering_color = color(0.05f) [[ 
+        anno::display_name("Scatter"),
+        anno::in_group("Transmission")
+    ]],
+
+    uniform texture_2d specular_transmission_scattering_color_image = texture_2d() [[ 
+        anno::display_name("Scatter Image"),
+        anno::in_group("Transmission")
+    ]],
+
+    float specular_transmission_scatter_anisotropy = float(0.0) [[ 
+        anno::display_name("Scatter Anisotropy"),
+        anno::in_group("Transmission"),
+		anno::soft_range(-1.0f, 1.0f),
+        anno::hard_range(-1.0f, 1.0f)
+    ]],
+
+    uniform texture_2d specular_transmission_scatter_anisotropy_image = texture_2d() [[ 
+        anno::display_name("Scatter Anisotropy Image"),
+        anno::in_group("Transmission")
+    ]],
+
+    uniform float specular_transmission_dispersion_abbe = float(0.0) [[ 
+        anno::display_name("Dispersion Abbe"),    
+        anno::in_group("Transmission"),
+        anno::soft_range(0.0f, 100.0f),
+        anno::hard_range(0.0f, limits::FLOAT_MAX)
+    ]],
+	
+	///////////////////////////////////////////////////
+    //Subsurface
+    //
+    uniform bool enable_diffuse_transmission = true [[
+        anno::display_name("Enable Subsurface"),
+        anno::description("Enables the use of subsurface"),
+        anno::in_group("Subsurface")
+    ]],
+    
+    uniform float subsurface_weight = float(0.65f) [[ 
+        anno::display_name("Weight"),
+        anno::in_group("Subsurface"),
+        anno::soft_range(0.0f, 1.0f)
+    ]],
+
+    uniform texture_2d subsurface_weight_image = texture_2d() [[ 
+        anno::display_name("Weight Image"),
+        anno::in_group("Subsurface")
+    ]],
+
+    uniform ::OmniSurface::OmniShared::scattering_colors_presets subsurface_scattering_colors_preset = 
+        ::OmniSurface::OmniShared::scattering_colors_custom [[
+        anno::display_name("Scattering Presets"),
+        anno::in_group("Subsurface")
+    ]],
+
+    // 20210226 NV, use base color
+    color subsurface_transmission_color = color(1.0) [[
+        anno::display_name("Color"),
+        anno::in_group("Subsurface")
+    ]],
+
+    uniform texture_2d subsurface_transmission_color_image = texture_2d() [[ 
+        anno::display_name("Color Image"),
+        anno::in_group("Subsurface")
+    ]],
+
+    color subsurface_scattering_color = color(1.0f, 0.3f, 0.2f) [[
+        anno::display_name("Radius (mfp)"),
+        anno::description("Multiply with Radius image to get final radius"),
+        anno::in_group("Subsurface")
+    ]],
+
+    uniform texture_2d subsurface_scattering_color_image = texture_2d() [[ 
+        anno::display_name("Radius Image"),
+        anno::in_group("Subsurface")
+    ]],
+
+    uniform float subsurface_scale = float(0.25f) [[
+        anno::display_name("Scale"),
+        anno::in_group("Subsurface"),
+        anno::soft_range(0.0f, 5.0f)
+    ]],
+
+    //Subsurface Advanced
+    //
+    uniform float R_Channel_Scatter_Scale = float(1.0) [[
+        anno::display_name("R_Channel_Scatter_Scale"),
+        anno::in_group("Subsurface Advanced"),
+        anno::hard_range(0.0f, 2.0f)
+    ]],
+    uniform float G_Channel_Scatter_Scale = float(1.0) [[
+        anno::display_name("G_Channel_Scatter_Scale"),
+        anno::in_group("Subsurface Advanced"),
+        anno::hard_range(0.0f, 2.0f)
+    ]],
+    uniform float B_Channel_Scatter_Scale = float(1.0) [[
+        anno::display_name("B_Channel_Scatter_Scale"),
+        anno::in_group("Subsurface Advanced"),
+        anno::hard_range(0.0f, 2.0f)
+    ]],
+    uniform float A_Channel_Scatter_Scale = float(1.0) [[
+        anno::display_name("A_Channel_Scatter_Scale"),
+        anno::in_group("Subsurface Advanced"),
+        anno::hard_range(0.0f, 2.0f)
+    ]],
+    uniform float Unmasked_Scatter_Scale = float(1.0) [[
+        anno::display_name("Unmasked_Scatter_Scale"),
+        anno::in_group("Subsurface Advanced"),
+        anno::hard_range(0.0f, 2.0f)
+    ]],
+
+    //Emission
+    //
+    float emission_weight = float(0.0) [[ 
+        anno::display_name("Weight"),
+        anno::in_group("Emission"),
+        anno::soft_range(0.0f, 1.0f)
+    ]],
+
+    color emission_color = color(1.0) [[
+        anno::display_name("Color (nit)"),
+        anno::in_group("Emission")
+    ]],
+
+    uniform texture_2d emission_color_image = texture_2d() [[ 
+        anno::display_name("Color Image"),
+        anno::in_group("Emission")
+    ]],
+
+    //Geometry
+    //
+    uniform bool thin_walled = false [[ 
+        anno::display_name("Thin Walled"),
+        anno::description("Thin surface with no interior."),
+        anno::in_group("Geometry")
+    ]],
+    uniform bool enable_opacity = false
+    [[
+        anno::display_name("Enable Opacity"),
+        anno::description("Enables the use of opacity"),
+        anno::in_group("Geometry")
+    ]],
+
+    uniform float geometry_opacity = float(1.0) [[
+        anno::display_name("Opacity"),
+        anno::in_group("Geometry"),
+		anno::soft_range(0.0f, 1.0f),
+        anno::hard_range(0.0f, 1.0f)
+    ]],
+
+    uniform texture_2d geometry_opacity_image = texture_2d() [[ 
+        anno::display_name("Opacity Image"),
+        anno::in_group("Geometry")
+    ]],
+
+    uniform ::OmniSurface::OmniImage::alpha_mode geometry_opacity_image_alpha_mode = 
+        ::OmniSurface::OmniImage::alpha_average [[
+        anno::display_name("Opacity Image Alpha Mode"),
+        anno::in_group("Geometry")
+    ]],
+
+    uniform float geometry_opacity_threshold = float(0.0) [[
+        anno::display_name("Opacity Threshold"),
+        anno::description("If > 0, remap opacity values to 1 when >= threshold and to 0 otherwise"),
+        anno::in_group("Geometry"),
+        anno::soft_range(0.0f, 1.0f),
+        anno::hard_range(0.0f, 1.0f)
+    ]],
+	///////////////////////////////////////////////
+	// UV	
+	uniform float2 uv_translate =  float2(0.0f)
+	[[
+		anno::display_name("UV Translate"),
+		anno::description("Controls position of texture."),
+		anno::in_group("UV")
+	]],
+	uniform float uv_rotate =  0.f
+	[[
+		anno::display_name("UV Rotate"),
+		anno::description("Rotates angle of texture in degrees."),
+		anno::in_group("UV")
+	]],
+	uniform float2 uv_scale =  float2(1.0f)
+	[[
+		anno::display_name("UV Scale"),
+		anno::description("Larger number increases size of texture."),
+		anno::in_group("UV")
+	]],
+	////////
+	uniform float2 opacity_uv_translate =  float2(0.0f)
+	[[
+		anno::display_name("opacity UV Translate"),
+		anno::in_group("UV")
+	]],
+	uniform float opacity_uv_rotate =  0.f
+	[[
+		anno::display_name("opacity UV Rotate"),
+		anno::in_group("UV")
+	]],
+	uniform float2 opacity_uv_scale =  float2(1.0f)
+	[[
+		anno::display_name("opacity UV Scale"),
+		anno::in_group("UV")
+	]],
+	////////
+	uniform float2 normal_uv_translate =  float2(0.0f)
+	[[
+		anno::display_name("normal UV Translate"),
+		anno::in_group("UV")
+	]],
+	uniform float normal_uv_rotate =  0.f
+	[[
+		anno::display_name("normal UV Rotate"),
+		anno::in_group("UV")
+	]],
+	uniform float2 normal_uv_scale =  float2(1.0f)
+	[[
+		anno::display_name("normal UV Scale"),
+		anno::in_group("UV")
+	]],
+////////
+	uniform float2 ao_uv_translate =  float2(0.0f)
+	[[
+		anno::display_name("AO UV Translate"),
+		anno::in_group("UV")
+	]],
+	uniform float ao_uv_rotate =  0.f
+	[[
+		anno::display_name("AO UV Rotate"),
+		anno::in_group("UV")
+	]],
+	uniform float2 ao_uv_scale =  float2(1.0f)
+	[[
+		anno::display_name("AO UV Scale"),
+		anno::in_group("UV")
+	]],
+////////
+	uniform float2 metal_uv_translate =  float2(0.0f)
+	[[
+		anno::display_name("Metallic UV Translate"),
+		anno::in_group("UV")
+	]],
+	uniform float metal_uv_rotate =  0.f
+	[[
+		anno::display_name("Metallic UV Rotate"),
+		anno::in_group("UV")
+	]],
+	uniform float2 metal_uv_scale =  float2(1.0f)
+	[[
+		anno::display_name("Metallic UV Scale"),
+		anno::in_group("UV")
+	]],
+////////
+	uniform float2 rough_uv_translate =  float2(0.0f)
+	[[
+		anno::display_name("roughness UV Translate"),
+		anno::in_group("UV")
+	]],
+	uniform float rough_uv_rotate =  0.f
+	[[
+		anno::display_name("roughness UV Rotate"),
+		anno::in_group("UV")
+	]],
+	uniform float2 rough_uv_scale =  float2(1.0f)
+	[[
+		anno::display_name("roughness UV Scale"),
+		anno::in_group("UV")
+	]],
+////////
+	uniform float2 emissive_uv_translate =  float2(0.0f)
+	[[
+		anno::display_name("Emissive UV Translate"),
+		anno::in_group("UV")
+	]],
+	uniform float emissive_uv_rotate =  0.f
+	[[
+		anno::display_name("Emissive UV Rotate"),
+		anno::in_group("UV")
+	]],
+	uniform float2 emissive_uv_scale =  float2(1.0f)
+	[[
+		anno::display_name("Emissive UV Scale"),
+		anno::in_group("UV")
+	]],
+////////
+	
+	uniform float2 blend_uv_translate =  float2(0.0f)
+	[[
+		anno::display_name("Blend map UV Translate"),
+		anno::description("Controls the position of the blendmap texture."),
+		anno::in_group("UV")
+	]],
+	uniform float  blend_uv_rotate =  0.f
+	[[
+		anno::display_name("Blend map UV Rotate"),
+		anno::description("Rotates angle of the blendmap texture in degrees."),
+		anno::in_group("UV")
+	]],
+	uniform float2 blend_uv_scale =  float2(1.0f)
+	[[
+		anno::display_name("Blend map UV Scale"),
+		anno::description("Larger numbers increase the size of the blendmap texture"),
+		anno::in_group("UV")
+	]],
+	uniform int uv_space_index =  0
+	[[
+		anno::display_name("UV Space Index"),
+		anno::in_group("UV")
+	]]
+
+)[[
+	anno::display_name("OmniRL SSS"),
+    anno::author("Reallusion"),
+    anno::version(3, 4, 1, ""),
+    anno::modified(2020, 3, 24, "")
+    
+]] = let {
+	    
+	float2 uv_ = float2(state::texture_coordinate(uv_space_index).x, state::texture_coordinate(uv_space_index).y);
+	float2 UV0 = TransformUV( uv_, GetUvFloat3x3( uv_scale, uv_translate, uv_rotate ) );
+	float2 uv_blendmap = TransformUV( uv_, GetUvFloat3x3( blend_uv_scale, blend_uv_translate, blend_uv_rotate ) );
+	float2 uv_opacity  = TransformUV( uv_, GetUvFloat3x3( opacity_uv_scale, opacity_uv_translate, opacity_uv_rotate ) );
+	float2 uv_normal   = TransformUV( uv_, GetUvFloat3x3( normal_uv_scale, normal_uv_translate, normal_uv_rotate ) )   ;
+	float2 uv_ao       = TransformUV( uv_, GetUvFloat3x3( ao_uv_scale,     ao_uv_translate,     ao_uv_rotate ) )       ;
+	float2 uv_metal    = TransformUV( uv_, GetUvFloat3x3( metal_uv_scale,  metal_uv_translate,  metal_uv_rotate ) )    ;
+	float2 uv_rough    = TransformUV( uv_, GetUvFloat3x3( rough_uv_scale,  rough_uv_translate,  rough_uv_rotate ) )    ;
+	float2 uv_emissive = TransformUV( uv_, GetUvFloat3x3( emissive_uv_scale, emissive_uv_translate, emissive_uv_rotate ) );
+    
+	///////////////////////////////////////////////////
+    //Base Color
+    float3 base_color_ = tex::texture_isvalid(diffuse_reflection_color_image) ? 
+        tex::lookup_float3(diffuse_reflection_color_image,UV0,tex::wrap_repeat,tex::wrap_repeat) :
+        float3(diffuse_reflection_weight);
+
+	float3 color_blended = tex::texture_isvalid(blend_map) ? 
+        BlendMapByMode( tex::lookup_float3(blend_map,uv_blendmap,tex::wrap_repeat,tex::wrap_repeat), base_color_, blend_map_strength, blend_map_mode ) 
+        : base_color_;
+
+	color diffuse_reflection_color_ = diffuse_color_constant * color( color_blended.x, color_blended.y, color_blended.z );
+	
+	///////////////////////////////////////////////////
+	// micro_normal_image
+
+	float2 MicroNormalUv = (UV0 * MicroNormal_Tiling);
+	float3 MicroNormalColor = tex::texture_isvalid(micro_normal_image) ? 
+	( tex::lookup_float3(micro_normal_image,MicroNormalUv,tex::wrap_repeat,tex::wrap_repeat) * float3(2,2,2) - float3(1,1,1) ) : float3( 0, 0, 1 );
+
+	float MicroNormalMask = tex::texture_isvalid( micro_normal_mask_image ) ? tex::lookup_float(micro_normal_mask_image,UV0,tex::wrap_repeat,tex::wrap_repeat) : 1;
+	float MicroNormalStr = MicroNormal_Strength * MicroNormalMask;
+	float3 MicroNormal = MicroNormalColor*float3(MicroNormalStr, (Flip_MicroNormal_Y ? -1 : 1 ) * MicroNormalStr,1);
+
+	float micro_normal_unnormalize_x = MicroNormalColor.x * MicroNormalStr; // for micro roughness	
+		// Normal
+    // Normal calculations, RL flip G
+    float3 map_normal =  tex::texture_isvalid(geometry_normal_image) ?
+                ( tex::lookup_float3(geometry_normal_image,uv_normal,tex::wrap_repeat,tex::wrap_repeat) * float3(2,2,2) - float3(1,1,1) )
+                            : float3( 0, 0, 1 ) ;
+
+	float3 map_normal_str = math::normalize( math::lerp( float3(0,0,1), map_normal, geometry_normal_strength ) );
+	float3 map_normal_flipY = geometry_normal_image_flip_g_channel ? map_normal_str * float3(1,-1,1) : map_normal_str;
+	float3 final_normal = math::normalize(BlendAngleCorrectedNormals( map_normal_flipY, MicroNormal ));
+
+	float3 geometry_normal_ = math::normalize(
+        state::texture_tangent_u(0) * final_normal.x +
+        state::texture_tangent_v(0) * final_normal.y +
+        state::normal() * (final_normal.z) );
+
+	///////////////////////////////////////////////////
+	//RGBA mask
+	//
+	float4 vRgbaMask = tex::texture_isvalid( rgba_area_mask_image ) ?
+		tex::lookup_float4(rgba_area_mask_image,UV0,tex::wrap_repeat,tex::wrap_repeat)
+		: float4( 0 );
+
+	///////////////////////////////////////////////////
+	//Roughness
+	//
+	float roughness_map_value = tex::texture_isvalid( specular_reflection_roughness_image ) ?
+		tex::lookup_float(specular_reflection_roughness_image,uv_rough,tex::wrap_repeat,tex::wrap_repeat)
+		: 0.5;
+
+	float fAreaRoughness = HQ_SkinRoughnessArea( R_Channel_Roughness_Scale,
+												 G_Channel_Roughness_Scale,
+												 B_Channel_Roughness_Scale,
+												 A_Channel_Roughness_Scale,
+												 vRgbaMask,
+												 Unmasked_Roughness_Scale );
+	
+	float fRoughnessLerp = math::lerp( roughness_01, roughness_02, roughness_lerp ); //Jeff 新增
+	
+    float fRoughnessmultiplier_temp = roughness_multiplier * fRoughnessLerp;//Jeff 新增
+
+	
+	float fContrastMicroRoughness = CheapContrast( Micro_Roughness_Scale + micro_normal_unnormalize_x, 1 );
+	float fLerpContrastMicroRough = math::lerp( 0.85f, 1, fContrastMicroRoughness );
+		
+	float fMicroRoughness = fAreaRoughness + Micro_Roughness_Scale + micro_normal_unnormalize_x;
+	float fEdgeRoughness = roughness_map_value + fMicroRoughness; // + Fresnel * edge_roughness_multiplier
+
+	float roughness_before_sss_weight = math::saturate( fEdgeRoughness * fLerpContrastMicroRough );	
+
+	///////////////////////////////////////////////////
+    //Metalness
+    //
+    float metalness_ = tex::texture_isvalid( metalness_image ) ?
+		tex::lookup_float(metalness_image,uv_metal,tex::wrap_repeat,tex::wrap_repeat)
+		: 0;
+
+    //Specular reflection
+    //
+    float specular_reflection_weight_ = tex::texture_isvalid( specular_reflection_weight_image ) ?
+		tex::lookup_float(specular_reflection_weight_image,UV0,tex::wrap_repeat,tex::wrap_repeat) * specular_reflection_weight
+		: specular_reflection_weight;
+	
+	///////////////////////////////////////////////////
+	//Specular transmission
+	float specular_transmission_weight_ = tex::texture_isvalid(specular_transmission_weight_image) ?
+		tex::lookup_float(specular_transmission_weight_image, UV0, tex::wrap_repeat,tex::wrap_repeat) * specular_transmission_weight
+			: specular_transmission_weight;
+
+	color specular_transmission_color_ =  tex::texture_isvalid(specular_transmission_color_image) ?
+        tex::lookup_float3(specular_transmission_color_image, UV0, tex::wrap_repeat,tex::wrap_repeat) * specular_transmission_color
+             : specular_transmission_color;
+	
+	float specular_transmission_scattering_depth_ = tex::texture_isvalid(specular_transmission_scattering_depth_image) ?
+		tex::lookup_float(specular_transmission_scattering_depth_image, UV0, tex::wrap_repeat,tex::wrap_repeat) * specular_transmission_scattering_depth
+				: specular_transmission_scattering_depth;
+
+	color specular_transmission_scattering_color_ = tex::texture_isvalid(specular_transmission_scattering_color_image) ?
+		tex::lookup_float3(specular_transmission_scattering_color_image, UV0, tex::wrap_repeat,tex::wrap_repeat) * specular_transmission_scattering_color
+				: specular_transmission_scattering_color;
+
+    float specular_transmission_scatter_anisotropy_= tex::texture_isvalid(specular_transmission_scatter_anisotropy_image) ?
+		tex::lookup_float(specular_transmission_scatter_anisotropy_image, UV0, tex::wrap_repeat,tex::wrap_repeat) * specular_transmission_scatter_anisotropy
+					: specular_transmission_scatter_anisotropy;
+
+
+	///////////////////////////////////////////////////
+    //Subsurface
+    //
+    
+    float sss_weight_map = tex::texture_isvalid( subsurface_weight_image )?
+    	tex::lookup_float(subsurface_weight_image,UV0,tex::wrap_repeat,tex::wrap_repeat)* subsurface_weight: subsurface_weight;
+    
+	float sss_weight = 	HQ_SkinSSSArea( R_Channel_Scatter_Scale,
+												G_Channel_Scatter_Scale,
+												B_Channel_Scatter_Scale,
+												A_Channel_Scatter_Scale,
+												vRgbaMask,
+												Unmasked_Scatter_Scale,
+												sss_weight_map );
+	
+	color subsurface_scattering_color_ = tex::texture_isvalid( subsurface_scattering_color_image ) ?
+			tex::lookup_float3(subsurface_scattering_color_image,UV0,tex::wrap_repeat,tex::wrap_repeat)
+			: float3( subsurface_scattering_color );
+ 
+    color subsurface_transmission_color_ = tex::texture_isvalid(subsurface_transmission_color_image) ?
+		tex::lookup_float3(subsurface_transmission_color_image, UV0, tex::wrap_repeat,tex::wrap_repeat) * subsurface_transmission_color
+				: subsurface_transmission_color;
+
+    //Roughness affected by sss_weight
+    float sss_roughness = math::lerp(1, fRoughnessmultiplier_temp,  math::saturate(sss_weight*10) );
+	float final_roughness = math::saturate( sss_roughness * roughness_before_sss_weight );//Jeff修改
+	
+    // //Emission
+    color emission_color_ = tex::texture_isvalid(emission_color_image) ?
+    	color( tex::lookup_float3(subsurface_scattering_color_image,uv_emissive,tex::wrap_repeat,tex::wrap_repeat) )
+        :emission_color;
+
+    float4 rgba = tex::texture_isvalid( geometry_opacity_image ) ?
+			tex::lookup_float4(geometry_opacity_image,uv_opacity,tex::wrap_repeat,tex::wrap_repeat)
+			: float4(geometry_opacity,geometry_opacity,geometry_opacity,geometry_opacity);
+	float geometry_opacity_ = adjust_opacity_RL( rgba, geometry_opacity_image_alpha_mode, geometry_opacity );
+
+} in
+	::OmniSurface::OmniSurfaceBase::OmniSurfaceBase(
+
+    //Base
+    //
+    diffuse_reflection_weight: diffuse_reflection_weight,
+    diffuse_reflection_color: diffuse_reflection_color_,
+	diffuse_reflection_roughness: 1.f,
+
+    //Metalness
+    //
+    metalness: metalness_,
+
+    //Specular reflection
+    //
+    specular_reflection_weight: specular_reflection_weight_, //Jeff修改,
+    specular_reflection_roughness:  final_roughness,
+    specular_reflection_color : specular_reflection_color,
+    specular_reflection_ior_preset: specular_reflection_ior_preset,
+    specular_reflection_ior: specular_reflection_ior,
+
+	//Specular transmission
+	enable_specular_transmission: enable_specular_transmission,
+	specular_transmission_weight: specular_transmission_weight_,
+	specular_transmission_color: specular_transmission_color_,
+	specular_transmission_scattering_depth: specular_transmission_scattering_depth_,
+	specular_transmission_scattering_color: specular_transmission_scattering_color_,
+    specular_transmission_scatter_anisotropy: specular_transmission_scatter_anisotropy_,
+	specular_transmission_dispersion_abbe: specular_transmission_dispersion_abbe,
+
+    //Subsurface
+	enable_diffuse_transmission: enable_diffuse_transmission,
+    subsurface_weight: sss_weight,
+    subsurface_scattering_colors_preset: subsurface_scattering_colors_preset,
+    subsurface_transmission_color: subsurface_transmission_color_, //diffuse_reflection_color_, // 20210226 NV subsurface_transmission_color_,
+    subsurface_scattering_color: subsurface_scattering_color_, 
+    subsurface_scale: subsurface_scale,
+
+    //Emission
+    //
+    emission_weight: emission_weight,
+    emission_color: emission_color_,
+
+    //Geometry
+    //
+    thin_walled: thin_walled,
+    enable_opacity: enable_opacity,
+
+    geometry_opacity: geometry_opacity_,
+    geometry_opacity_threshold: geometry_opacity_threshold,
+    geometry_normal: geometry_normal_
+	);

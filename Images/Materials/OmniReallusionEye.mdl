@@ -1,0 +1,514 @@
+mdl 1.6;
+
+import ::anno::*;
+import ::base::*;
+import ::limits::*;
+import ::state::*;
+import ::tex::*;
+import ::math::*;
+
+import ::OmniSurface::OmniSurfaceBase::*;
+
+float2 scaleUVsByCenter(float2 uv, float scale) {
+    return float2(0.5) + (uv - float2(0.5)) * scale;
+}
+
+float2 CustomRotator(float2 uv, float2 center, float angle)
+{
+    float2 center_to_uv = (uv - center);
+    float s = math::sin(angle);
+    float c = math::cos(angle);
+
+    float center_to_uv_dot_ = math::dot(center_to_uv, float2(c, -s));
+    float center_to_uv_dot  = math::dot(center_to_uv, float2(s, c));
+    return center + float2(center_to_uv_dot_, center_to_uv_dot);
+}
+
+float SphereMask( float2 uv, float2 Origin, float Radius, float Hardness )
+{
+    float2 uv2 = uv - Origin;
+    float len = math::length( uv2 );
+    len = ( len / Radius ) ; 
+    len = ( 1 - len ) ; 
+    float Softness = 1.f - Hardness;
+    float mask = len / Softness; 
+    mask = math::min ( math::max ( mask , 0 ) , 1 ) ; 
+    return mask;
+}
+
+float2 ML_EyeRefraction_IrisMask_Func(float IrisUVRadius, float2 UV, float2 LimbusUVWidth) {
+    // Iris Mask with Limbus Ring falloff
+    float2 UV_ = UV - float2(0.5f, 0.5f);
+
+    float2 m, r;
+    r = (math::length(UV_) - (IrisUVRadius - LimbusUVWidth)) / LimbusUVWidth;
+    m = math::saturate(1 - r);
+    m = math::smoothstep(float2(0.0), float2(1.0), m);
+    return m;
+}
+
+float2 ScaleUVFromCenter(float2 UV, float PupilScale, float dist){
+    // Scale UVs from from unit circle in or out from center
+    // float2 UV, float PupilScale
+
+    float2 UVcentered = UV - float2(0.5f, 0.5f);
+    float UVlength = math::length(UVcentered);
+    // UV on circle at distance 0.5 from the center, in direction of original UV
+    float2 UVmax = math::normalize(UVcentered)*dist;
+
+    float2 UVscaled = math::lerp(UVmax, float2(0.f, 0.f), math::saturate((1.f - UVlength*0.5f)*PupilScale));
+    return UVscaled + float2(0.5f, 0.5f);
+}
+
+float Pick(float x1, float x2, float a)
+{
+    if (a < 0.5)
+        return x1;
+
+    return x2;
+}
+
+float3 BlendOverlay(float3 a, float3 b )
+{
+    float3 vA = 2.0f * a * b;
+    float3 vB = 1.0f - 2.0f * ( 1.0f - a ) * ( 1.0f - b );
+    float3 vOverlay;
+
+    vOverlay.x = Pick(vA.x, vB.x, a.x);
+    vOverlay.y = Pick(vA.y, vB.y, a.y);
+    vOverlay.z = Pick(vA.z, vB.z, a.z);
+
+    return vOverlay;
+}
+
+struct IrisMask_Input
+{
+    float2 uv;
+    float Limbus_UV_Width_Color;
+    float Limbus_UV_Width_Shading;
+    float Sclera_UV_Radius;
+    float Iris_UV_Radius;
+};
+
+float2 ML_EyeRefraction_IrisMask_Block(IrisMask_Input input)
+{
+    float2 LimbusUVWidth = float2( input.Limbus_UV_Width_Color, input.Limbus_UV_Width_Shading );    
+    float2 uv = scaleUVsByCenter( input.uv, 1/input.Sclera_UV_Radius );
+
+    return ML_EyeRefraction_IrisMask_Func( input.Iris_UV_Radius, uv, LimbusUVWidth );
+}
+
+
+
+export enum BlendMode
+[[ 
+    anno::description("Blending Mode")
+]]
+{
+    Blend_Mode_Multipy = 0,
+    Blend_Mode_Addition = 1,
+    Blend_Mode_Overlay = 2
+};
+
+
+struct BaseColorMakeData {
+    float3 base_color;
+    float3 blend;
+    float blend_strength;
+
+    BlendMode blend_mode; // 0 multiply, 1 addition, 2 overlay
+};
+
+struct BaseColorMakeOutput {
+    float3 base_color;
+};
+
+BaseColorMakeOutput BaseColorMake(BaseColorMakeData data)
+{
+    float3 a = math::lerp(0.0, data.blend, data.blend_strength);
+    float3 b = math::lerp(1.0, data.blend, data.blend_strength);
+
+    float3 blend = BlendOverlay(data.base_color, b);
+    float3 add = data.base_color + a;
+    float3 mul = data.base_color * b;
+
+    float3 base = data.base_color;
+    switch (data.blend_mode)
+    {
+        case Blend_Mode_Multipy: base = mul; break;
+        case Blend_Mode_Addition: base = add; break;
+        case Blend_Mode_Overlay: base = blend; break;
+    }
+
+    return BaseColorMakeOutput(base_color: base);
+}
+
+export material OmniRLEye(
+
+    // ********* Texture Settings *********
+    uniform texture_2d diffuse_reflection_color_image = texture_2d() [[ 
+        anno::display_name("Color Image"),
+        anno::in_group("Texture Settings")
+    ]],
+
+    uniform texture_2d metalness_image = texture_2d() [[ 
+        anno::display_name("Metallic Image"),
+        anno::in_group("Texture Settings")
+    ]],
+
+    uniform texture_2d specular_reflection_roughness_image = texture_2d()[[
+        anno::display_name("Roughness Image"),
+        anno::in_group("Texture Settings")
+    ]],
+
+
+
+    // ********* Textures **********
+    uniform texture_2d tx2d_Iris_Normal = texture_2d() [[ 
+        anno::display_name("Iris Normal"),
+        anno::in_group("Textures")
+    ]],
+
+    uniform texture_2d tx2d_Sclera = texture_2d() [[ 
+        anno::display_name("Sclera"),
+        anno::in_group("Textures")
+    ]],
+
+    uniform texture_2d tx2d_Sclera_Normal = texture_2d() [[ 
+        anno::display_name("Sclera Normal"),
+        anno::in_group("Textures")
+    ]],
+
+    uniform texture_2d tx2d_Inner_Iris_Mask = texture_2d() [[ 
+        anno::display_name("Inner Iris Mask"),
+        anno::in_group("Textures")
+    ]],
+
+    uniform texture_2d tx2d_EyeBlendMap2 = texture_2d() [[
+        anno::display_name("Base Color Blend Map"),
+        anno::in_group("Textures")
+    ]],
+
+    uniform texture_2d tx2d_Iris_Displacement = texture_2d() [[
+        anno::display_name("Displacement Map"),
+        anno::in_group("Textures")
+    ]],    
+
+    /*
+    uniform texture_2d blend_texture = texture_2d() [[
+        anno::display_name("Blend Map"),
+        anno::in_group("Textures")
+    ]],
+    */
+
+    float diffuse_reflection_weight = float(1.0) [[
+        anno::display_name("Weight"),
+        anno::in_group("Base"),
+        anno::hard_range(0.0f, 1.0f)
+    ]],
+
+    color diffuse_color_constant = color(1.0f)
+    [[
+        anno::display_name("Diffuse"),
+        anno::description("base color tint")
+    ]],
+
+
+    // ********* Eye ball *********
+    float BlendMap2_Strength = float(0) [[
+        anno::display_name("Base Color Blend Map Strength"),
+        anno::hard_range(0.0f, 1.0f),
+        anno::in_group("Eye")
+    ]],
+
+    float Shadow_Radius = float(0.4) [[
+        anno::display_name("Shadow Radius"),
+        anno::hard_range(0.0f, 1.0f),
+        anno::in_group("Eye")
+    ]],
+
+    float Shadow_Hardness = float(0.4) [[
+        anno::display_name("Shadow Hardness"),
+        anno::hard_range(-1.0f, 1.0f),
+        anno::in_group("Eye")
+    ]],
+
+    float Specular_Scale = float(0.8) [[
+        anno::display_name("Specualr Scale"),
+        anno::hard_range(0.0f, 1.0f),
+        anno::in_group("Eye")
+    ]],
+
+    bool Is_Left_Eye = false [[
+        anno::display_name("Is Left Eye"),
+        anno::in_group("Eye")
+    ]],    
+
+    color Eye_Corner_Darkness_Color = color(0.531, 0.438, 0.404) [[
+        anno::display_name("Eye Corner Darkness Color"),
+        anno::in_group("Eye")
+    ]],
+
+
+    // ********* Iris *********
+    float Iris_Depth_Scale = float(1.3) [[
+        anno::display_name("Iris Depth Scale"),
+        anno::hard_range(0.0f, 2.5f),
+        anno::in_group("Iris")
+    ]],
+
+    float Iris_Roughness = float(1.0) [[
+        anno::display_name("Iris Roughness"),
+        anno::hard_range(0.0f, 1.0f),
+        anno::in_group("Iris")
+    ]],    
+
+    float Iris_Color_Brightness = float(1.0) [[
+        anno::display_name("Iris Color Brightness"),
+        anno::hard_range(0.0f, 5.0f),
+        anno::in_group("Iris")
+    ]],
+
+    float Pupil_Scale = float(0.96) [[
+        anno::display_name("Pupil Scale"),
+        anno::hard_range(0.91f, 1.1f),
+        anno::in_group("Iris")
+    ]],
+
+    uniform float IoR = float(1.4) [[
+        anno::hidden()
+    ]],
+
+    color Iris_Cloudy_Color = color(0, 0.01, 0.01) [[
+        anno::display_name("Iris Cloudy Color"),
+        anno::in_group("Iris")
+    ]],
+
+    color Iris_Inner_Color = color(1.0) [[
+        anno::display_name("Iris Inner Color"),
+        anno::in_group("Iris")
+    ]],
+
+    float Iris_Inner_Scale = float(1.0) [[
+        anno::display_name("Iris inner scale"),
+        anno::hard_range(0.0f, 1.0f),
+        anno::in_group("Iris")
+    ]],  
+
+    float Iris_UV_Radius = float(0.145) [[
+        anno::display_name("Iris UV Radius"),
+        anno::hard_range(0.01f, 0.160001f),
+        anno::in_group("Iris")
+    ]],
+
+    color Iris_Color = color(1.0) [[
+        anno::display_name("Iris Color"),
+        anno::in_group("Iris")
+    ]],
+
+    //Limbus
+    float Limbus_UV_Width_Color = float(0.025)[[
+        anno::display_name("Limbus UV Width Color"),
+        anno::hard_range(0.0f, 0.2f),
+        anno::in_group("Limbus")
+    ]],
+
+    float Limbus_Dark_Scale = float(1.0) [[
+        anno::display_name("Limbus Dark Scale"),
+        anno::hard_range(0.0f, 10.0f),
+        anno::in_group("Limbus")
+    ]],    
+
+
+
+    // ********* Sclera *********
+    float ScleraBrightness = float(1.0) [[
+        anno::display_name("Sclera Brightness"),
+        anno::hard_range(0.0f, 5.0f),
+        anno::in_group("Sclera")
+    ]],
+
+    float Sclera_Roughness = float(1.0) [[
+        anno::display_name("Sclera Roughness"),
+        anno::hard_range(0.0f, 1.0f),
+        anno::in_group("Sclera")
+    ]],
+
+    float Sclera_Flatten_Normal = float(0.452) [[
+        anno::display_name("Sclera Flatten Normal"),
+        anno::hard_range(-5.0f, 5.0f),
+        anno::in_group("Sclera")
+    ]],
+
+    float Sclera_Normal_UV_Scale = float(1.0) [[
+        anno::display_name("Sclera Normal UV Scale"),
+        anno::hard_range(0.0f, 5.0f),
+        anno::in_group("Sclera")
+    ]],
+
+    float Sclera_UV_Radius = float(1.0) [[
+        anno::display_name("Sclera UV Radius"),
+        anno::hard_range(0.58f, 1.0f),
+        anno::in_group("Sclera")
+    ]],
+
+    //SSS
+    color scatter_color = color(1.0) [[
+        anno::display_name("Scatter Color"),
+        anno::in_group("Subsurface Scatter")
+    ]],
+
+    float subsurface_weight = float(0) [[
+        anno::display_name("Subsurface Weight"),
+        anno::hard_range(0.0f, 1.0f),
+        anno::in_group("Subsurface Scatter")
+    ]]
+
+) = let {
+    float limbus_pow = 5.0;
+    float Limbus_UV_Width_Shading = 0.2;
+
+    //Basic
+    float2 UV0 = float2(state::texture_coordinate(0).x, state::texture_coordinate(0).y);
+    float3 diffuse = tex::texture_isvalid(diffuse_reflection_color_image) ? tex::lookup_float3(diffuse_reflection_color_image,UV0,tex::wrap_repeat,tex::wrap_repeat) : float3(1);
+    float fIsLeftEye = Is_Left_Eye ? 1.0 : 0.0;
+    float2 corrected_eye_uv = Is_Left_Eye ? (float2(1.0, 0.0) - float2(UV0.x, -UV0.y)) : UV0;
+
+    IrisMask_Input iris_mask_input = IrisMask_Input(
+        uv: UV0,
+        Limbus_UV_Width_Color: Limbus_UV_Width_Color,
+        Limbus_UV_Width_Shading: Limbus_UV_Width_Shading,
+        Sclera_UV_Radius: Sclera_UV_Radius,
+        Iris_UV_Radius: Iris_UV_Radius
+    );
+
+    float2 irisMaskData = ML_EyeRefraction_IrisMask_Block(iris_mask_input);
+    float irisMask = irisMaskData.x;
+
+
+
+    //Normal
+    // Sclera Normal
+    float2 scaled_sclera_uv = scaleUVsByCenter(UV0, 1.0 / Sclera_Normal_UV_Scale);
+    float2 scleraNormalUv = !Is_Left_Eye ? float2(1.0) - math::frac(scaled_sclera_uv) : scaled_sclera_uv;
+    
+    float3 sclera_normal_sample = tex::texture_isvalid(tx2d_Sclera_Normal) ? tex::lookup_float3(tx2d_Sclera_Normal,scleraNormalUv,tex::wrap_repeat,tex::wrap_repeat) * float3(2.0) - float3(1.0) : float3(0, 0, 1);    
+    float3 sclera_normal_flip_Y = false ? sclera_normal_sample * float3(1,-1,1) : sclera_normal_sample;
+    float3 corrected_sclera_normal_sample = !Is_Left_Eye ? sclera_normal_flip_Y * float3(-1, -1, 1) : sclera_normal_flip_Y;
+    
+    float3 sclera_tangent_normal = math::lerp(corrected_sclera_normal_sample, float3(0.0, 0.0, 1.0), math::lerp(Sclera_Flatten_Normal, 1, irisMask));
+    float3 eye_tangent_normal = math::normalize(sclera_tangent_normal);
+
+	float3 eye_normal = math::normalize(
+        state::texture_tangent_u(0) * eye_tangent_normal.x +
+        state::texture_tangent_v(0) * eye_tangent_normal.y +
+        state::normal() * (eye_tangent_normal.z) );
+
+    // Final Normal
+    float3 normal = eye_normal;
+
+
+    //Limbus
+    float2 limus_UV = float2(Limbus_UV_Width_Color, Limbus_UV_Width_Shading);
+
+    //Iris
+    float iris_by_sclera_uv_radius = Iris_UV_Radius * Sclera_UV_Radius + 0.5;
+    float2 depthPlaneOffset_uv = float2(iris_by_sclera_uv_radius, 0.5);
+    float depthPlaneOffset = tex::texture_isvalid(tx2d_Iris_Displacement) ? tex::lookup_float(tx2d_Iris_Displacement, depthPlaneOffset_uv) : float(0);
+    float displacement = tex::texture_isvalid(tx2d_Iris_Displacement) ? tex::lookup_float(tx2d_Iris_Displacement, UV0,tex::wrap_repeat,tex::wrap_repeat) : float(0);
+
+    //Sclera
+    float2 sclera_scaled_uv = scaleUVsByCenter(UV0, 1.0 / Sclera_UV_Radius);
+    //float2 sclera_rotated_scaled_uv = CustomRotator(sclera_scaled_uv, float2(0.5, 0.5), 0.5);
+    float2 sclera_rotated_scaled_uv = float2(1.0, 1.0) - math::frac(sclera_scaled_uv);
+    float2 sclera_apply_UV = math::lerp(sclera_rotated_scaled_uv, sclera_scaled_uv, fIsLeftEye);
+
+    float3 sclera_color = (tex::texture_isvalid(tx2d_Sclera) ? 
+                            tex::lookup_float3(tx2d_Sclera, sclera_apply_UV, tex::wrap_clamp, tex::wrap_clamp) : float3(1)
+                            ) * ScleraBrightness;
+
+    //Eye ball corner darkness
+    float kShaowHardnessRatio = 1.4;
+    float corner_darkness_mask = SphereMask(sclera_scaled_uv, 0.5, Shadow_Radius, Shadow_Hardness * kShaowHardnessRatio);
+    float3 corner_darkness = math::lerp(Eye_Corner_Darkness_Color, 1.0, corner_darkness_mask);
+
+    //Pupil Size
+    float kPupil_ScaleRatio = 1.013698;
+    float2 pupil_uv_refraction = sclera_scaled_uv;
+    float inv_iris_uv_diameter = (1 / (Iris_UV_Radius * 2.0));
+    float2 pupil_uv_ = ((pupil_uv_refraction - 0.5) * inv_iris_uv_diameter ) + 0.5;
+    float2 pupil_uv = ScaleUVFromCenter(pupil_uv_, Pupil_Scale * kPupil_ScaleRatio, 0.5);
+
+
+    //Limbus Color
+    float limbus_color = 1 - math::pow(math::length(((pupil_uv - 0.5) * Limbus_Dark_Scale)), limbus_pow);
+
+    //Iris Color
+    color iris_color_scaled = Iris_Color * Iris_Color_Brightness;
+    float iris_pupil_scale = math::lerp(0.92, 0.952, Iris_Inner_Scale);
+    float2 inner_iris_mask_uv = ScaleUVFromCenter(pupil_uv, iris_pupil_scale, 4.0);
+    float irisInnerMask = tex::texture_isvalid(tx2d_Inner_Iris_Mask) ? 
+                                    tex::lookup_float3(tx2d_Inner_Iris_Mask,inner_iris_mask_uv,tex::wrap_repeat,tex::wrap_repeat).y : 
+                                    float(0.0);
+
+    color masked_iris_color = math::lerp(iris_color_scaled, Iris_Inner_Color, irisInnerMask);
+    float3 albedo_sample = tex::texture_isvalid(diffuse_reflection_color_image) ? tex::lookup_float3(diffuse_reflection_color_image, pupil_uv, tex::wrap_repeat, tex::wrap_repeat) : float3(1.0);
+    float3 albedo = math::lerp(float3(0), albedo_sample, irisMask);
+    color masked_iris_albedo = (masked_iris_color * (albedo * Iris_Color_Brightness));
+    float3 iris_base_color = math::lerp(sclera_color, limbus_color * masked_iris_albedo, irisMask);
+    float3 cloudy_base_color = SphereMask(pupil_uv, 0.5, 0.18, 0.2) * Iris_Cloudy_Color;
+
+    float3 base_color = (iris_base_color + cloudy_base_color) * corner_darkness;
+
+    //Blend
+    //float3 blend = tex::texture_isvalid(blend_texture) ? tex::lookup_float(blend_texture, UV0, tex::wrap_repeat, tex::wrap_repeat) : float3(1.0);
+    float3 blend = float3(1.0);
+
+    //Final blend color
+    BaseColorMakeOutput base_color_make_out = BaseColorMake( BaseColorMakeData(
+                                                base_color: base_color,
+                                                blend: blend,
+                                                blend_strength: 0.0,
+                                                blend_mode: Blend_Mode_Multipy
+                                                ) );
+
+
+    //Blend2
+    float3 blend2_sample = tex::texture_isvalid(tx2d_EyeBlendMap2) ? tex::lookup_float3(tx2d_EyeBlendMap2, corrected_eye_uv, tex::wrap_repeat, tex::wrap_repeat) : float3(1.0);
+    float3 blend2_result = math::lerp(1.0, blend2_sample, BlendMap2_Strength);
+
+    // Final Base Color
+    float3 final_base_color = base_color_make_out.base_color * blend2_result * diffuse_color_constant;
+
+
+    //Physical property
+    float2 roughnessUV = UV0;
+
+    float roughness_sample = tex::texture_isvalid(specular_reflection_roughness_image) ? tex::lookup_float3(specular_reflection_roughness_image, roughnessUV, tex::wrap_repeat, tex::wrap_repeat).y : float(0.0);
+    float metallic_sample = tex::texture_isvalid(metalness_image) ? tex::lookup_float3(metalness_image, UV0, tex::wrap_repeat, tex::wrap_repeat).y : float(0.0);
+    
+    float roughness = roughness_sample + math::lerp(Sclera_Roughness, Iris_Roughness, irisMaskData.y);
+    float metallic = metallic_sample;
+
+} in 
+ ::OmniSurface::OmniSurfaceBase::OmniSurfaceBase(
+    diffuse_reflection_weight: diffuse_reflection_weight,    
+    diffuse_reflection_color: final_base_color,    
+	diffuse_reflection_roughness: 1.f,
+
+    metalness: metallic,
+
+    specular_reflection_weight: Specular_Scale,
+    specular_reflection_roughness: roughness,
+    specular_reflection_ior: float(1.2),
+
+    //Subsurface
+    enable_diffuse_transmission: true,
+    subsurface_weight: subsurface_weight,
+    subsurface_transmission_color: final_base_color,
+    subsurface_scattering_color: scatter_color,
+
+    enable_opacity: false,
+    geometry_opacity: 0.0,
+    geometry_normal: normal
+);

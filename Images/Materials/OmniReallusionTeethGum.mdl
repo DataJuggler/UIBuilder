@@ -1,0 +1,467 @@
+//* 3.5.0 - for CC3.5
+
+mdl 1.6;
+
+import ::anno::*;
+import ::base::*;
+import ::limits::*;
+import ::state::*;
+import ::tex::*;
+import ::math::*;
+
+import OmniReallusionSurfaceBaseTeeth::*;
+
+// Generic algorithm to desaturate images used in most game engines
+float3 desaturate(float3 c, float factor)
+{
+	float3 lum = float3(0.299, 0.587, 0.114);
+	float3 gray = float3(math::dot(lum, c));
+	return float3(math::lerp(c, gray, factor));
+}
+
+float3 BlendAngleCorrectedNormals( float3 BaseNormal, float3 SubNormal )
+{
+    float ZPlus1 = BaseNormal.z + 1;
+    float3 vBaseZPlus1 = float3( BaseNormal.x, BaseNormal.y, ZPlus1 );
+    float3 vSubFlipRG = float3( -SubNormal.x, -SubNormal.y, SubNormal.z );
+    float fDot = math::dot( vBaseZPlus1, vSubFlipRG );
+    return ( vBaseZPlus1 * fDot ) - ( ZPlus1 * vSubFlipRG );
+}
+
+
+// naming ref OmniPBR
+export material OmniRLTeethGum(
+
+    // -------------------- Base Color ----------------------
+    uniform texture_2d diffuse_reflection_color_image = texture_2d()
+    [[
+        anno::display_name("Base Color Map"),
+        anno::in_group("Base Color")
+    ]],
+
+    color diffuse_color_constant = color(1.0f)
+    [[
+        anno::display_name("Base Color"),
+        anno::description("base color tint"),
+        anno::in_group("Base Color")
+    ]],
+    
+    // -------------------- Normal Texture ----------------------
+    uniform texture_2d geometry_normal_image = texture_2d()
+    [[
+        anno::display_name("Normal Map"),
+        anno::description("Enables the usage of the normalmap texture"),
+        anno::in_group("Normal")
+    ]],
+
+    uniform bool geometry_normal_image_flip_g_channel = false [[
+        anno::display_name("Normal Map Flip G Channel"),
+        anno::in_group("Normal")
+    ]],
+
+    uniform float geometry_normal_strength = float(0.7f) [[
+        anno::display_name("Normal Map Strength"),
+        anno::in_group("Normal"),
+        anno::soft_range(0.0f, 1.0f)
+    ]],
+
+
+    // -------------------- AO Texture ----------------------
+    uniform texture_2d g_tx2dAO = texture_2d() [[
+        anno::display_name("AO"),
+        anno::description("The Ambient Occlusion texture for the material"),
+        anno::in_group("AO")
+    ]],    
+
+    // -------------------- Roughness Texture ----------------------
+    uniform texture_2d specular_reflection_roughness_image = texture_2d() //reflectionroughness_texture
+    [[
+        anno::display_name("Roughness"),
+        anno::in_group("Roughness")
+    ]], 
+
+    // -------------------- Metallic Texture ----------------------
+    uniform texture_2d metalness_image = texture_2d()
+    [[
+        anno::display_name("Metallic"),
+        anno::in_group("Metallic")
+    ]],    
+
+
+    // -------------------- Textures --------------------
+    uniform texture_2d tx2d_Gums_Mask = texture_2d() [[
+        anno::display_name("Gums Mask"),
+        anno::description("Mask texture to define teeth and gum area"),
+        anno::in_group("Textures")
+    ]],      
+
+    uniform texture_2d tx2d_Gradient_AO = texture_2d() [[
+        anno::display_name("Gradient AO"),
+        anno::description("The Area Gradient texture for the material"),
+        anno::in_group("Textures")
+    ]],        
+
+
+    uniform texture_2d tx2d_MicroNormal = texture_2d()
+    [[
+        anno::display_name("Micro Normal"),
+        anno::description("Enables the Micro normal texture"),
+        anno::in_group("Textures")        
+    ]],            
+
+
+    // -------------------- Micro Normal ----------------------
+
+
+    uniform bool Flip_MicroNormal_Y = false [[
+        anno::display_name("Flip Micro Normal Y"),
+        anno::in_group("Micro Normal")
+    ]],
+
+    uniform float Teeth_MicroNormal_Tiling = 10
+    [[
+        anno::display_name("Teeth Micro Normal Tiling"),
+        anno::description("Tiling scale for teeth micro normal"),
+        anno::in_group("Micro Normal") 
+    ]],
+
+    uniform float Teeth_MicroNormal_Strength = 0.3
+    [[
+        anno::display_name("Teeth Micro Normal Strength"),
+        anno::description("strength scale for teeth micro normal"),
+        anno::soft_range(0.0, 1.),
+        anno::in_group("Micro Normal") 
+    ]],
+
+    uniform float MicroNormal_Tiling = 10
+    [[
+        anno::display_name("Gum Micro Normal Tiling"),
+        anno::description("Tiling scale for gum micro normal"),
+        anno::in_group("Micro Normal") 
+    ]],
+
+    uniform float MicroNormal_Strength = 1
+    [[
+        anno::display_name("Gum Micro Normal Strength"),
+        anno::description("strength scale for gum micro normal"),
+        anno::soft_range(0.0,1.),
+        anno::in_group("Micro Normal") 
+    ]],
+
+
+
+    // -------------------- TeethGum_Setting --------------------
+    color Teeth_Edge_Color = color(0.224, 0.108, 0.0793)
+    [[
+        anno::display_name("Teeth Edge Color"),
+        anno::in_group("TeethGum Setting")
+    ]],
+
+
+    float edge_color_exponent = float(1.6) [[
+        anno::display_name("Edge Color Exponent"),
+        anno::in_group("TeethGum Setting")
+    ]],    
+
+
+    uniform bool Is_Upper_Teeth = false [[
+        anno::display_name("Is Upper Teeth"),
+        anno::in_group("TeethGum Setting")
+    ]],
+
+    uniform float Teeth_Brightness = 0.7
+    [[
+        anno::display_name("Teeth Brightness"),
+        anno::soft_range(0.0, 5.),
+        anno::in_group("TeethGum Setting")
+    ]],
+
+    uniform float Teeth_Desaturation = 0.1
+    [[
+        anno::display_name("Teeth Desaturation"),
+        anno::soft_range(-1.0, 1.0),
+        anno::in_group("TeethGum Setting")
+    ]],    
+
+    uniform float Brightness = 1.0
+    [[
+        anno::display_name("Gum Brightness"),
+        anno::soft_range(0.0,5.),
+        anno::in_group("TeethGum Setting")
+    ]],  
+
+
+    uniform float Desaturation = 0.0
+    [[
+        anno::display_name("Gum Desaturation"),
+        anno::soft_range(-1.0, 1.),
+        anno::in_group("TeethGum Setting")
+    ]],
+
+    //For Omniverse
+    float Front_Roughness_OV = 0.2
+    [[
+            anno::hidden()
+    ]],    
+
+
+    //From iClone
+    float Front_Roughness = 0.03
+    [[
+        anno::display_name("Front Roughness"),
+        anno::soft_range(0.0,1.),
+        anno::in_group("TeethGum Setting")
+
+    ]],
+
+
+    //For Omniverse
+    float Front_Specular_OV = 0.8
+    [[
+        anno::hidden()
+    ]],
+
+
+    //From iClone
+    float Front_Specular = 0.5
+    [[
+        anno::display_name("Front Specular"),
+        anno::soft_range(0.0, 1.),
+        anno::in_group("TeethGum Setting")
+    ]],
+
+
+    float Front_AO = 1
+    [[
+        anno::display_name("Front AO"),
+        anno::soft_range(0.0, 1.),
+        anno::in_group("TeethGum Setting")
+    ]],    
+
+    float Back_AO = 1
+    [[
+        anno::display_name("Rear AO"),
+        anno::soft_range(0.0, 1.),
+        anno::in_group("TeethGum Setting")
+    ]],
+
+
+    //For Omniverse
+    float Back_Roughness_OV = 0.2
+    [[
+        anno::hidden()
+    ]],
+
+
+    //From iClone
+    float Back_Roughness = 0.03
+    [[
+        anno::display_name("Rear Roughness"),
+        anno::soft_range(0.0,1.),
+        anno::in_group("TeethGum Setting") 
+    ]],
+
+
+    //For Omniverse
+    float Back_Specular_OV = 0.4
+    [[
+        anno::hidden()
+    ]],
+
+    //From iClone
+    float Back_Specular = 0.5
+    [[
+        
+        anno::display_name("Rear Specular"),
+        anno::soft_range(0.0, 1.),
+        anno::in_group("TeethGum Setting")
+    ]],
+
+
+    // -------------------- Subsurface Scatter --------------------
+
+    color subsurface_transmission_color = color(1.f, 1.f, 1.f) [[
+        anno::display_name("Color"),
+        anno::in_group("Subsurface")
+    ]],
+
+    uniform texture_2d subsurface_transmission_color_image = texture_2d() [[ 
+        anno::display_name("Color Image"),
+        anno::in_group("Subsurface")
+    ]],
+
+    color subsurface_scattering_color = color(1.f, 0.3f, 0.2f) [[
+		anno::display_name("Radius (mfp)"),
+        anno::description("Multiply with Radius image to get final radius"),
+        anno::in_group("Subsurface")
+    ]],
+
+    //For Omniverse
+    uniform float subsurface_weight_strength_OV = 0.2
+    [[
+        anno::display_name("Subsurface Gums Weight"),
+        anno::description("sufsurface weight"),
+        anno::soft_range(0.0,1.),
+        anno::in_group("Subsurface") 
+    ]],     
+
+    //From IC
+    uniform float subsurface_weight_strength = 0.1
+    [[
+        anno::hidden()
+    ]],    
+
+    uniform float Scatter = 1.0
+    [[
+        anno::display_name("Gums Scatter"),
+        anno::description("Gums scatter"),
+        anno::soft_range(0.0,3.),
+        anno::in_group("Subsurface") 
+    ]],   
+     
+    uniform float Teeth_Scatter = 2.0
+    [[
+        anno::display_name("Teeth Scatter"),
+        anno::description("Teeth scatter"),
+        anno::soft_range(0.0,3.),
+        anno::in_group("Subsurface") 
+    ]],
+
+    //For Omniverse
+    uniform float subsurface_teeth_weight_strength_OV = 0.65
+    [[
+        anno::display_name("Subsurface Teeth Weight"),
+        anno::description("sufsurface weight"),
+        anno::soft_range(0.0, 1.),
+        anno::in_group("Subsurface") 
+    ]],    
+
+
+    //From IC
+    uniform float subsurface_teeth_weight_strength = 1.0
+    [[
+        anno::hidden()
+    ]]
+
+) [[  
+    anno::display_name("OmniRL Teeth Gum"),
+    anno::version(3, 4, 1, ""),
+    anno::modified(2021, 03, 24, "")
+]] = let {
+    bool isTongue = false;
+	float2 UV0 = float2(state::texture_coordinate(0).x, state::texture_coordinate(0).y);
+    float teethSample = tex::texture_isvalid(tx2d_Gums_Mask) ? tex::lookup_float(tx2d_Gums_Mask,UV0,tex::wrap_repeat,tex::wrap_repeat) : 1 ;
+    float isTeeth =  isTongue ? 0 : teethSample;
+    float3 gradient_sample = tex::texture_isvalid(tx2d_Gradient_AO) ? tex::lookup_float3(tx2d_Gradient_AO,UV0,tex::wrap_repeat,tex::wrap_repeat) : float3(1);
+    float blend_gradient = isTongue ? gradient_sample.z : math::lerp(gradient_sample.x, gradient_sample.y, Is_Upper_Teeth);
+
+    //AO 
+	float blend_ao = (tex::texture_isvalid(g_tx2dAO) ? tex::lookup_float(g_tx2dAO,UV0,tex::wrap_repeat,tex::wrap_repeat) : 1 ) * blend_gradient;         
+
+    float ao = blend_ao;
+    float ao_weight = math::lerp(Back_AO, Front_AO, blend_gradient);
+    float apply_ao = ao_weight;
+
+
+
+    // Normal
+    float2 normal_uv = UV0;
+    float3 map_normal =  tex::texture_isvalid(geometry_normal_image) ?
+                ( tex::lookup_float3(geometry_normal_image,normal_uv,tex::wrap_repeat,tex::wrap_repeat) * float3(2,2,2) - float3(1,1,1) )
+                            : float3( 0, 0, 1 ) ;
+    float3 apply_normal = math::normalize(math::lerp( float3(0, 0, 1), map_normal, geometry_normal_strength ));
+    float3 map_normal_flipY = geometry_normal_image_flip_g_channel ? apply_normal * float3(1,-1,1) : apply_normal;
+
+    //Micro Normal
+    float2 mircor_normal_uv = UV0 * math::lerp(MicroNormal_Tiling, Teeth_MicroNormal_Tiling, isTeeth); 
+    float3 micro_normal = tex::texture_isvalid(tx2d_MicroNormal) ? 
+                            (tex::lookup_float3(tx2d_MicroNormal, mircor_normal_uv, tex::wrap_repeat, tex::wrap_repeat) * float3(2,2,2) - float3(1,1,1) ) 
+                            : float3(0, 0, 1);
+
+    float micro_normal_strength = math::lerp(MicroNormal_Strength, Teeth_MicroNormal_Strength, isTeeth); 
+    float3 apply_micro_normal = math::normalize(math::lerp(float3(0, 0, 1), micro_normal, micro_normal_strength));
+    float3 map_micro_normal_flipY = Flip_MicroNormal_Y ? apply_micro_normal * float3(1,-1,1) : apply_micro_normal;
+
+    float3 tangent_space_normal = math::normalize(BlendAngleCorrectedNormals(map_normal_flipY, map_micro_normal_flipY));
+	float3 geometry_normal_ = math::normalize(
+        state::texture_tangent_u(0) * tangent_space_normal.x +
+        state::texture_tangent_v(0) * tangent_space_normal.y +
+        state::normal() * (tangent_space_normal.z) );
+
+    
+    //albedo
+    float3 base_color_ = (tex::texture_isvalid(diffuse_reflection_color_image) ? 
+        tex::lookup_float3(diffuse_reflection_color_image,UV0,tex::wrap_repeat,tex::wrap_repeat) :
+        float3(1)) * diffuse_color_constant;
+
+
+    float3 teeth_color = desaturate( math::max(math::pow(base_color_, 0.75), base_color_), Teeth_Desaturation) * Teeth_Brightness;
+    float3 flesh_color = desaturate( base_color_, Desaturation) * Brightness;
+    float3 base_color = math::lerp(flesh_color, teeth_color, isTeeth);
+    float3 final_base_color = base_color * apply_ao;
+
+    //Edge Color
+    color edge_reflection_color = math::lerp(final_base_color, Teeth_Edge_Color * apply_ao, isTeeth);
+
+    //specular
+    color specular_reflection_color = color(1.0) * apply_ao;
+    float specular_weight = math::lerp(Back_Specular, Front_Specular, blend_gradient) * apply_ao * 8;
+
+    //Roughness
+    float rough_color_ = tex::texture_isvalid(specular_reflection_roughness_image) ? 
+        tex::lookup_float(specular_reflection_roughness_image,UV0,tex::wrap_repeat,tex::wrap_repeat) :
+        1;
+    float roughness = math::pow(rough_color_, 0.667) * math::lerp(Back_Roughness, Front_Roughness, blend_gradient) / 2 ;
+
+    //Metallic
+    float3 metal_color_ = tex::texture_isvalid(metalness_image) ? 
+        tex::lookup_float3(metalness_image,UV0,tex::wrap_repeat,tex::wrap_repeat):
+        float3(0);
+
+    //SSS
+    float final_subsurface_weight_strength = math::lerp(subsurface_weight_strength_OV, subsurface_teeth_weight_strength_OV, isTeeth) * apply_ao;
+    float final_scatter = math::lerp(Scatter, Teeth_Scatter, isTeeth);
+    
+    color subsurface_transmission_color_ = tex::texture_isvalid(subsurface_transmission_color_image) ?
+		tex::lookup_float3(subsurface_transmission_color_image, UV0, tex::wrap_repeat,tex::wrap_repeat) * subsurface_transmission_color
+				: subsurface_transmission_color;
+} in
+    OmniReallusionSurfaceBaseTeeth::OmniSurfaceBaseRL(
+
+    //Diffuse reflection
+    //
+    diffuse_reflection_color: final_base_color,
+    metalness: metal_color_.x,
+    specular_reflection_weight: specular_weight,
+    specular_reflection_roughness: roughness,
+    specular_reflection_color: specular_reflection_color,    
+    specular_reflection_ior: 1.35,
+
+
+    edge_color_exponent: edge_color_exponent,
+    base_edge_color_weight: 1.0,
+    edge_reflection_color: edge_reflection_color,
+    
+    //Subsurface
+    //
+    subsurface_weight: final_subsurface_weight_strength,
+
+    subsurface_transmission_color: subsurface_transmission_color_,
+    subsurface_scattering_color: subsurface_scattering_color,
+    subsurface_scale: final_scatter,
+    
+    //Geometry
+    //
+    thin_walled: false,
+	enable_opacity: false,
+    geometry_opacity: 1.0,
+    geometry_normal: geometry_normal_
+
+    );
+	
+	
+	
+	
+	
+	
+	
